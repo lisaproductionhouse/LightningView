@@ -24,7 +24,10 @@ jobs:
        startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
       - name: Submit manifest to winget-pkgs
-        uses: vedantmgoyal2009/winget-releaser@v2
+        # The action's owner renamed the repo (vedantmgoyal2009 -> vedantmgoyal9);
+        # the old path only resolves through GitHub's rename redirect. v2 is still
+        # the current major.
+        uses: vedantmgoyal9/winget-releaser@v2
         with:
           # The package identifier in the winget-pkgs repository.
           # On first submission this identifier must be reserved by you.

@@ -20,7 +20,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
       # Install GUI dependencies for eframe/egui and clipboard support
       - name: Install dependencies
@@ -29,7 +29,7 @@ jobs:
           sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -117,7 +117,7 @@ jobs:
       # on Linux/Windows.)
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Calculate Cargo hash
         id: cargo-hash
@@ -129,7 +129,7 @@ jobs:
           fi
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -317,7 +317,7 @@ jobs:
           fi
           
       - name: Archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: result-${{ matrix.TARGET }}
           path: |
@@ -328,10 +328,10 @@ jobs:
     needs: test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -398,7 +398,7 @@ jobs:
           cargo wix --no-build --nocapture
 
       - name: Archive MSI
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: result-msi
           path: target/wix/*.msi
@@ -407,7 +407,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -415,7 +415,7 @@ jobs:
           sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -429,7 +429,7 @@ jobs:
         run: cargo deb
 
       - name: Archive Debian package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: result-deb
           path: target/debian/*.deb
@@ -439,7 +439,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -447,7 +447,7 @@ jobs:
           sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols fuse libfuse2 desktop-file-utils
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -491,7 +491,7 @@ jobs:
             --output appimage
 
       - name: Archive AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: result-appimage
           # Match only LightningView-prefixed AppImages so the linuxdeploy
@@ -503,7 +503,7 @@ jobs:
     needs: build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Determine version
         id: ver
@@ -518,7 +518,7 @@ jobs:
           echo "version=$VER" >> $GITHUB_OUTPUT
 
       - name: Download Windows build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: result-x86_64-pc-windows-msvc
           path: ./win-zip
@@ -552,7 +552,7 @@ jobs:
           choco pack lightningview.nuspec --out ../../
 
       - name: Archive Chocolatey package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: result-chocolatey
           path: ./*.nupkg
@@ -563,7 +563,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Flatpak Dependencies
         run: |
@@ -606,7 +606,7 @@ jobs:
           upload-artifact: false
 
       - name: Archive Flatpak Bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: result-flatpak
           path: lightningview.flatpak
@@ -619,7 +619,7 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
           # Only the artifacts the build jobs publish for release. Guards
@@ -628,7 +628,7 @@ jobs:
           pattern: result-*
 
       - name: Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
            files: |
             ./artifacts/*/*.tar.gz

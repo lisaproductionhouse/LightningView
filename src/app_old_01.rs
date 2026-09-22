@@ -39,14 +39,6 @@ const MAX_TEXTURE_SIDE: usize = 2048;
 /// (slow/hung decoder, bad file). After this we respawn the worker and unblock
 /// the bulk preload so the app doesn't sit there silently forever.
 const FULL_RES_WATCHDOG: Duration = Duration::from_secs(20);
-/// Native (1:1) zoom level, in the pixel-per-pixel sense — one of the two
-/// candidates for the interactive-zoom floor. The other is `fit_zoom(...)`;
-/// scrolling out is clamped to whichever of the two is smaller, so a large
-/// image stops at "fits the window" while a small image stops at its native
-/// size instead of shrinking further. `is_scaled_to_fit` is unaffected by
-/// this floor — it can still shrink (or grow) an image past either bound to
-/// fit the window exactly.
-const MIN_ZOOM: f32 = 1.0;
 
 /// Fit `content` (in pixels) into `area`, preserving aspect ratio and centering.
 /// Used to letterbox/pillarbox video frames in the central panel.
@@ -64,17 +56,6 @@ fn fit_centered(content: Vec2, area: Rect) -> Rect {
     }
     let offset = (area.size() - size) * 0.5;
     Rect::from_min_size(area.min + offset, size)
-}
-
-/// The zoom level that exactly fits `content` within `area`, preserving
-/// aspect ratio — the same ratio `fit_centered` scales to, and what
-/// `is_scaled_to_fit` drives `zoom` to. Used to compute the interactive-zoom
-/// floor: `fit_zoom(...).min(MIN_ZOOM)`.
-fn fit_zoom(content: Vec2, area: Rect) -> f32 {
-    if content.x <= 0.0 {
-        return MIN_ZOOM;
-    }
-    fit_centered(content, area).width() / content.x
 }
 
 /// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
@@ -247,56 +228,6 @@ fn delete_dialog_layout(area: Rect) -> (Rect, Rect, Rect) {
     (panel, cancel, delete)
 }
 
-/// Name of the per-directory folder that "deleted" files are moved into
-/// instead of being removed from disk.
-const DELETE_FOLDER_NAME: &str = "_DELETE";
-
-/// Move `path` into a `_DELETE` subfolder alongside it, rather than deleting
-/// it outright. This makes "Delete" recoverable: the file just leaves the
-/// active view and lands in `<parent>/_DELETE/` until the user empties that
-/// folder themselves. If a same-named file is already there, a numbered
-/// suffix (`name (1).ext`, `name (2).ext`, ...) is appended so nothing already
-/// in `_DELETE` gets silently overwritten.
-fn move_to_delete_folder(path: &Path) -> std::io::Result<PathBuf> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let delete_dir = parent.join(DELETE_FOLDER_NAME);
-    fs::create_dir_all(&delete_dir)?;
-
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
-    })?;
-    let mut dest = delete_dir.join(file_name);
-
-    if dest.exists() {
-        let stem = path.file_stem().unwrap_or(file_name).to_string_lossy().into_owned();
-        let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
-        let mut n = 1u32;
-        loop {
-            let candidate_name = match &ext {
-                Some(ext) => format!("{stem} ({n}).{ext}"),
-                None => format!("{stem} ({n})"),
-            };
-            let candidate = delete_dir.join(candidate_name);
-            if !candidate.exists() {
-                dest = candidate;
-                break;
-            }
-            n += 1;
-        }
-    }
-
-    fs::rename(path, &dest)?;
-    Ok(dest)
-}
-
-/// View state saved when a middle-click "peek at 1:1" starts, so releasing
-/// the button can restore exactly what was on screen before.
-struct ZoomPeek {
-    zoom: f32,
-    offset: Vec2,
-    is_scaled_to_fit: bool,
-}
-
 pub struct ImageViewerApp {
     image: Option<DisplayableImage>,
     /// Active video playback state. Mutually exclusive with `image`.
@@ -324,9 +255,6 @@ pub struct ImageViewerApp {
     // --- input state (event-driven) ---
     mouse_pos: Vec2,
     dragging: bool,
-    /// `Some` while the middle mouse button is held to peek at 1:1; holds the
-    /// view to restore when it's released. See `ZoomPeek`.
-    zoom_peek: Option<ZoomPeek>,
     /// Set when a drag/zoom happened this frame; suppresses the bounce physics
     /// for that frame (mirrors the old `is_interacting`).
     interacted: bool,
@@ -367,7 +295,6 @@ impl ImageViewerApp {
             keybindings,
             mouse_pos: Vec2::ZERO,
             dragging: false,
-            zoom_peek: None,
             interacted: false,
             context_menu: None,
             scrubbing: false,
@@ -399,7 +326,6 @@ impl ImageViewerApp {
 
         self.is_scaled_to_fit = true;
         self.velocity = Vec2::ZERO;
-        self.zoom_peek = None;
         self.full_res_pending = false;
         self.full_res_pending_since = None;
 
@@ -577,24 +503,16 @@ impl ImageViewerApp {
             }
             match reply.result {
                 Ok(loaded) => {
-                    let (new_width, new_height) = match &loaded {
-                        LoadedImage::Static(img) => (img.width() as f32, img.height() as f32),
+                    let new_width = match &loaded {
+                        LoadedImage::Static(img) => img.width() as f32,
                         LoadedImage::Animated(frames) => {
-                            let first = frames.first();
-                            (
-                                first.map(|f| f.image.width()).unwrap_or(0) as f32,
-                                first.map(|f| f.image.height()).unwrap_or(0) as f32,
-                            )
+                            frames.first().map(|f| f.image.width()).unwrap_or(0) as f32
                         }
                     };
                     let preview_width = reply.preview_width as f32;
                     if preview_width > 0.0 && new_width > 0.0 && !self.is_scaled_to_fit {
-                        // Preserve the user's current view across the preview→full swap,
-                        // without letting the swap itself sneak the zoom under the floor.
-                        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-                        let min_zoom =
-                            fit_zoom(Vec2::new(new_width, new_height), area).min(MIN_ZOOM);
-                        self.zoom = (self.zoom * preview_width / new_width).max(min_zoom);
+                        // Preserve the user's current view across the preview→full swap.
+                        self.zoom *= preview_width / new_width;
                     }
                     match loaded {
                         LoadedImage::Static(full_res) => {
@@ -806,22 +724,19 @@ impl ImageViewerApp {
         }
     }
 
-    /// Move the current file into `_DELETE` (after confirmation) and advance.
+    /// Delete the current file (after confirmation) and advance.
     fn perform_delete(&mut self, renderer: &Renderer) {
         self.show_delete_confirmation = false;
         let Some(path) = self.image_files.get(self.image_order[self.current_index]).cloned() else {
             return;
         };
-        // Compute the cache path before moving — the hash needs the file's size/mtime.
+        // Compute the cache path before deleting — the hash needs the file's size/mtime.
         let cache_path = preload_cache_path(&path);
-        let dest = match move_to_delete_folder(&path) {
-            Ok(dest) => dest,
-            Err(e) => {
-                self.last_error = Some(format!("Failed to delete file: {}", e));
-                return;
-            }
-        };
-        log::info!("Moved file to {}: {} -> {}", DELETE_FOLDER_NAME, path.display(), dest.display());
+        if let Err(e) = fs::remove_file(&path) {
+            self.last_error = Some(format!("Failed to delete file: {}", e));
+            return;
+        }
+        log::info!("Deleted file: {}", path.display());
         if cache_path.exists() {
             if let Err(e) = fs::remove_file(&cache_path) {
                 log::warn!("Failed to delete preload cache {}: {}", cache_path.display(), e);
@@ -917,26 +832,6 @@ impl ImageViewerApp {
                     self.context_menu = Some(p);
                 }
             }
-            Event::MouseButtonDown { mouse_btn: MouseButton::Middle, x, y, .. } => {
-                // Peek at 1:1: jump the zoom to native size anchored on the click
-                // point, remembering the current view so releasing snaps back to it.
-                if self.image.is_some() && !self.show_delete_confirmation && self.context_menu.is_none() {
-                    let p = Vec2::new(*x, *y);
-                    self.mouse_pos = p;
-                    self.zoom_peek = Some(ZoomPeek {
-                        zoom: self.zoom,
-                        offset: self.offset,
-                        is_scaled_to_fit: self.is_scaled_to_fit,
-                    });
-                    let old_zoom = self.zoom;
-                    let image_coords = (p - self.offset) / old_zoom;
-                    self.zoom = MIN_ZOOM;
-                    self.offset -= image_coords * (self.zoom - old_zoom);
-                    self.is_scaled_to_fit = false;
-                    self.velocity = Vec2::ZERO;
-                    self.interacted = true;
-                }
-            }
             Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
                 if self.scrubbing {
                     // Commit the seek to the marker's final position.
@@ -947,16 +842,6 @@ impl ImageViewerApp {
                     }
                 }
                 self.dragging = false;
-            }
-            Event::MouseButtonUp { mouse_btn: MouseButton::Middle, .. } => {
-                // End the peek: snap straight back to the view it interrupted.
-                if let Some(saved) = self.zoom_peek.take() {
-                    self.zoom = saved.zoom;
-                    self.offset = saved.offset;
-                    self.is_scaled_to_fit = saved.is_scaled_to_fit;
-                    self.velocity = Vec2::ZERO;
-                    self.interacted = true;
-                }
             }
             Event::MouseMotion { x, y, xrel, yrel, .. } => {
                 let p = Vec2::new(*x, *y);
@@ -971,11 +856,6 @@ impl ImageViewerApp {
                     if let Some(g) = seek_bar_geom(area) {
                         self.scrub_frac = seek_bar_frac_at(&g, p.x);
                     }
-                } else if self.zoom_peek.is_some() {
-                    // Track the cursor 1:1 while peeking (zoom stays locked at native size).
-                    let delta = Vec2::new(*xrel, *yrel);
-                    self.offset += delta;
-                    self.interacted = true;
                 } else if self.dragging && self.image.is_some() {
                     let delta = Vec2::new(*xrel, *yrel);
                     self.offset += delta;
@@ -986,28 +866,18 @@ impl ImageViewerApp {
                 }
             }
             Event::MouseWheel { y, mouse_x, mouse_y, .. } => {
-                if let Some(image) = &self.image {
-                    if *y != 0.0 {
-                        let cursor = Vec2::new(*mouse_x, *mouse_y);
-                        let old_zoom = self.zoom;
-                        // Scale the wheel delta to roughly match the old feel.
-                        let scroll = *y * 40.0;
-                        let zoom_delta = (scroll / 200.0) * self.zoom;
-                        let full_res_size = Vec2::new(
-                            image.full_res_image.width() as f32,
-                            image.full_res_image.height() as f32,
-                        );
-                        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-                        // Never shrink past whichever is smaller: the image already
-                        // fully fits on screen, or it's already at its native size.
-                        let min_zoom = fit_zoom(full_res_size, area).min(MIN_ZOOM);
-                        self.zoom = (self.zoom + zoom_delta).max(min_zoom);
-                        let image_coords = (cursor - self.offset) / old_zoom;
-                        self.offset -= image_coords * (self.zoom - old_zoom);
-                        self.is_scaled_to_fit = false;
-                        self.velocity = Vec2::ZERO;
-                        self.interacted = true;
-                    }
+                if self.image.is_some() && *y != 0.0 {
+                    let cursor = Vec2::new(*mouse_x, *mouse_y);
+                    let old_zoom = self.zoom;
+                    // Scale the wheel delta to roughly match the old feel.
+                    let scroll = *y * 40.0;
+                    let zoom_delta = (scroll / 200.0) * self.zoom;
+                    self.zoom = (self.zoom + zoom_delta).max(0.001);
+                    let image_coords = (cursor - self.offset) / old_zoom;
+                    self.offset -= image_coords * (self.zoom - old_zoom);
+                    self.is_scaled_to_fit = false;
+                    self.velocity = Vec2::ZERO;
+                    self.interacted = true;
                 }
             }
             _ => {}
@@ -1192,7 +1062,7 @@ impl ImageViewerApp {
                 if !self.dragging {
                     self.offset += self.velocity;
                 }
-                let interacting = self.dragging || self.interacted || self.zoom_peek.is_some();
+                let interacting = self.dragging || self.interacted;
                 if !interacting {
                     let screen_size = area.size();
                     let scaled = full_res_size * self.zoom;

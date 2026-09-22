@@ -1,0 +1,640 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Name matches package.name in Cargo.toml
+  NAME: lightningview
+  # Bundle name matches package.metadata.bundle.name
+  BUNDLE_NAME: LightningView
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      
+      # Install GUI dependencies for eframe/egui and clipboard support
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ./target
+          key: test-cargo-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run tests
+        # Git dependencies (crawler/imagepipe) are handled automatically by cargo
+        run: cargo test --verbose
+
+#  flatpak:
+#    name: Build Linux Flatpak
+#    needs: test
+#    runs-on: ubuntu-latest
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Install Flatpak Dependencies
+#        run: |
+#          sudo apt-get update
+#          sudo apt-get install -y flatpak flatpak-builder elfutils
+#          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+#          sudo flatpak install -y flathub org.freedesktop.Sdk//24.08 \
+#                                          org.freedesktop.Platform//24.08 \
+#                                          org.freedesktop.Sdk.Extension.rust-stable//24.08 \
+#                                          org.freedesktop.Sdk.Extension.llvm18//24.08
+#      - name: Vendor Dependencies
+#        run: |
+#          mkdir -p .cargo
+#
+#          rm Cargo.lock
+#          cargo generate-lockfile
+#
+#          # Standard vendor for crates.io dependencies
+#          cargo vendor > .cargo/config.toml
+#          
+#          # Manual override for the 'rawler' (dnglab) git dependency
+#          echo "" >> .cargo/config.toml
+#          echo '[source."https://github.com/dividebysandwich/dnglab.git?diamond_fix=1"]' >> .cargo/config.toml
+#          echo 'git = "https://github.com/dividebysandwich/dnglab.git?diamond_fix=1"' >> .cargo/config.toml
+#          echo 'replace-with = "vendored-sources"' >> .cargo/config.toml
+#
+#          # Manual override for the 'imagepipe' git dependency
+#          echo "" >> .cargo/config.toml
+#          echo '[source."https://github.com/dividebysandwich/imagepipe"]' >> .cargo/config.toml
+#          echo 'git = "https://github.com/dividebysandwich/imagepipe"' >> .cargo/config.toml
+#          echo 'replace-with = "vendored-sources"' >> .cargo/config.toml
+#
+#      - name: Build Flatpak
+#        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+#        with:
+#          bundle: io.github.dividebysandwich.lightningview.flatpak
+#          manifest-path: io.github.dividebysandwich.lightningview.yml
+#          cache-key: flatpak-builder-${{ github.sha }}
+#
+#      - name: Upload Flatpak Bundle
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: flatpak-bundle
+#          path: io.github.dividebysandwich.lightningview.flatpak
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - TARGET: x86_64-unknown-linux-gnu
+            OS: ubuntu-latest
+          # Only aarch64 macOS: ffmpeg-sys-next links the Homebrew FFmpeg libs,
+          # which install for the runner's native arch (arm64 on macos-latest),
+          # so an x86_64 cross-build would fail to link.
+          - TARGET: aarch64-apple-darwin
+            OS: macos-latest
+          - TARGET: x86_64-pc-windows-msvc
+            OS: windows-latest
+    needs: test
+    runs-on: ${{ matrix.OS }}
+    env:
+      TARGET: ${{ matrix.TARGET }}
+      OS: ${{ matrix.OS }}
+      # SDL3's vendored cmake build defaults to the runner's macOS SDK (e.g. 15.x),
+      # while rustc links aarch64-apple-darwin at 11.0 — that mismatch makes the
+      # newer Apple linker fail. Read by cmake, cc, and rustc alike, so this pins
+      # the SDL build and the final link to the same deployment target. (Ignored
+      # on Linux/Windows.)
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Calculate Cargo hash
+        id: cargo-hash
+        run: |
+          if command -v sha256sum > /dev/null; then
+            echo "hash=$(sha256sum Cargo.lock | awk '{print $1}')" >> $GITHUB_OUTPUT
+          else
+            echo "hash=$(shasum -a 256 Cargo.lock | awk '{print $1}')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ./target
+          key: build-cargo-registry-${{ matrix.TARGET }}-${{ steps.cargo-hash.outputs.hash }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Homebrew ships FFmpeg (with its .pc files) and pkg-config; dylibbundler
+          # makes the .app self-contained by copying the FFmpeg dylibs into it.
+          brew install ffmpeg pkg-config dylibbundler
+
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Prebuilt FFmpeg full (GPL) shared dev build from gyan.dev.
+          # ffmpeg-sys-next looks for $FFMPEG_DIR/include and $FFMPEG_DIR/lib.
+          # gyan rotates the versioned /packages/ files (they 404 once superseded),
+          # so use the stable "latest release" URL. It currently ships FFmpeg 9.x,
+          # whose soname-versioned DLLs (avcodec-63.dll, ...) match the names
+          # hard-coded in wix/main.wxs; if a future release bumps those majors,
+          # update wix/main.wxs (and the MSI job's DLL check) to match.
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z -UseBasicParsing
+          7z x ffmpeg.7z -offmpeg-dist -y | Out-Null
+          $root = (Get-ChildItem ffmpeg-dist -Directory | Select-Object -First 1).FullName
+          echo "FFMPEG_DIR=$root" >> $env:GITHUB_ENV
+          # libclang is needed by bindgen (used by ffmpeg-sys-next).
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          # The .zip + MSI need the FFmpeg DLLs next to the binary at runtime.
+          echo "FFMPEG_BIN=$root\bin" >> $env:GITHUB_ENV
+
+      - name: Install rust target
+        run: rustup target add $TARGET
+
+      - name: Install cargo-bundle
+        if: runner.os == 'macOS'
+        run: cargo install cargo-bundle
+
+      # SDL_GPU consumes a different shader bytecode per backend: DXIL on Windows
+      # (D3D12) and MSL on macOS (Metal). build.rs transpiles our SPIR-V to those
+      # via the `shadercross` CLI, so it must be on PATH for the build on those
+      # platforms. Linux uses SPIR-V (Vulkan) directly and needs no shadercross.
+      # SDL_shadercross ships no binaries, so we build it via vcpkg (preinstalled
+      # on the runners), which pulls a prebuilt DXC + SDL3 + SPIRV-Cross and
+      # exposes the `shadercross` tool.
+      - name: Install SDL_shadercross (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkg = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
+          & "$vcpkg\vcpkg.exe" install sdl3-shadercross --triplet x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg failed to install sdl3-shadercross" }
+          $tool = Get-ChildItem -Path "$vcpkg\installed" -Recurse -Filter shadercross.exe | Select-Object -First 1
+          if (-not $tool) { throw "shadercross.exe not found after vcpkg install" }
+          echo "$($tool.DirectoryName)" >> $env:GITHUB_PATH
+          # Also expose the triplet's bin/ so runtime-loaded DLLs (dxcompiler.dll,
+          # dxil.dll for signing, SDL3.dll) resolve.
+          $bin = Join-Path $tool.Directory.Parent.Parent.FullName "bin"
+          if (Test-Path $bin) { echo "$bin" >> $env:GITHUB_PATH }
+          & "$($tool.FullName)" --help
+
+      # The vcpkg `sdl3-shadercross` port can't be used here: it requires
+      # directx-dxc (DXIL), which has no arm64-macOS build. Metal only needs MSL,
+      # which doesn't use DXC — so get just SDL3 + SPIRV-Cross from vcpkg (both
+      # support arm64-osx) and build the shadercross CLI from source with DXC off.
+      # This still uses shadercross's own SDL_GPU-correct MSL binding remap.
+      - name: Install SDL_shadercross (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          vcpkg="${VCPKG_INSTALLATION_ROOT:-/usr/local/share/vcpkg}"
+          "$vcpkg/vcpkg" install sdl3 spirv-cross --triplet arm64-osx
+          git clone --depth 1 https://github.com/libsdl-org/SDL_shadercross.git "$RUNNER_TEMP/sc-src"
+          cmake -S "$RUNNER_TEMP/sc-src" -B "$RUNNER_TEMP/sc-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=arm64-osx \
+            -DSDLSHADERCROSS_DXC=OFF \
+            -DSDLSHADERCROSS_VENDORED=OFF \
+            -DSDLSHADERCROSS_SHARED=OFF \
+            -DSDLSHADERCROSS_STATIC=ON \
+            -DSDLSHADERCROSS_SPIRVCROSS_SHARED=OFF \
+            -DSDLSHADERCROSS_CLI=ON \
+            -DSDLSHADERCROSS_INSTALL=OFF
+          cmake --build "$RUNNER_TEMP/sc-build" --config Release
+          tool=$(find "$RUNNER_TEMP/sc-build" -name shadercross -type f -perm +111 | head -1)
+          if [ -z "$tool" ]; then echo 'shadercross CLI not found after build'; exit 1; fi
+          echo "$(dirname "$tool")" >> "$GITHUB_PATH"
+          "$tool" --help || true
+
+      - name: Run build (Linux/Windows)
+        if: runner.os != 'macOS'
+        run: cargo build --release --verbose --target $TARGET
+
+      - name: Run bundle (macOS)
+        if: runner.os == 'macOS'
+        env:
+          # Homebrew on Apple Silicon installs under /opt/homebrew; pkg-config
+          # finds the FFmpeg .pc files there for ffmpeg-sys-next.
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/lib
+        run: cargo bundle --release --target $TARGET
+
+      - name: Bundle FFmpeg dylibs into the .app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # The Homebrew dylibs aren't present on end-user machines, so copy them
+          # (and their non-system transitive deps) into the .app's Frameworks dir
+          # and rewrite the install names — making the bundle runnable without
+          # Homebrew. install_name_tool edits invalidate the signature, so ad-hoc
+          # re-sign the whole .app afterwards.
+          APP_DIR="./target/$TARGET/release/bundle/osx"
+          APP=$(find "$APP_DIR" -maxdepth 1 -name '*.app')
+          BIN=$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -n1)
+          mkdir -p "$APP/Contents/Frameworks"
+          dylibbundler --overwrite-dir --bundle-deps \
+            --fix-file "$BIN" \
+            --dest-dir "$APP/Contents/Frameworks" \
+            --install-path "@executable_path/../Frameworks/"
+          codesign --force --deep --sign - "$APP"
+
+      - name: Stage FFmpeg DLLs next to the binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # ffmpeg full-shared ships LGPL shared libs; place them next to
+          # lightningview.exe so the .zip is runnable without FFmpeg installed.
+          Copy-Item "$env:FFMPEG_BIN\*.dll" "target/$env:TARGET/release/" -Force
+
+      - name: Install zip (Windows)
+        if: runner.os == 'Windows'
+        run: choco install zip
+        
+      - name: Compress
+        run: |
+          mkdir -p ./artifacts
+          if [[ $GITHUB_REF_TYPE =~ ^tag$ ]]; then
+            TAG=$GITHUB_REF_NAME
+          else
+            TAG=$GITHUB_SHA
+          fi
+
+          # Windows
+          if [[ $OS =~ ^windows.*$ ]]; then
+              EXEC=$NAME.exe
+              mv ./target/$TARGET/release/$EXEC ./$EXEC
+              # Ship the bundled FFmpeg DLLs alongside the exe.
+              cp ./target/$TARGET/release/*.dll ./ || true
+              zip ./artifacts/$NAME-$TARGET-$TAG.zip $EXEC *.dll README.md LICENSE
+          
+          # MacOS
+          elif [[ $OS =~ ^macos.*$ ]]; then
+              # cargo-bundle outputs to target/release/bundle/osx/
+              # The folder name here relies on [package.metadata.bundle] name = "LightningView"
+              APP_DIR="./target/$TARGET/release/bundle/osx"
+              
+              # Find the .app directory name automatically to be safe
+              APP_NAME_WITH_EXT=$(find "$APP_DIR" -name "*.app" -maxdepth 1 -exec basename {} \;)
+
+              if [ -z "$APP_NAME_WITH_EXT" ]; then
+                  echo "Error: No .app directory found in $APP_DIR"
+                  exit 1
+              fi
+              
+              echo "Zipping app: $APP_NAME_WITH_EXT"
+              
+              # Copy aux files into .app parent dir for zipping
+              cp ./README.md "$APP_DIR/" || true
+              cp ./LICENSE "$APP_DIR/" || true
+              
+              (cd "$APP_DIR" && zip -r -q "../../../../../artifacts/$NAME-$TARGET-$TAG.zip" "$APP_NAME_WITH_EXT" README.md LICENSE)
+          # Linux
+          else
+              EXEC=$NAME
+              mv ./target/$TARGET/release/$EXEC ./$EXEC
+              tar -czf ./artifacts/$NAME-$TARGET-$TAG.tar.gz $EXEC README.md LICENSE
+          fi
+          
+      - name: Archive artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-${{ matrix.TARGET }}
+          path: |
+            ./artifacts
+
+  build-msi:
+    name: Build Windows MSI
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ./target
+          key: msi-cargo-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install FFmpeg (shared dev build)
+        shell: pwsh
+        run: |
+          # See the build job for rationale; gyan's stable "latest release" URL
+          # (the versioned /packages/ files 404 once superseded).
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z -UseBasicParsing
+          7z x ffmpeg.7z -offmpeg-dist -y | Out-Null
+          $root = (Get-ChildItem ffmpeg-dist -Directory | Select-Object -First 1).FullName
+          # Fail fast with a clear message if the release bumped soname majors,
+          # rather than letting it surface later as a confusing WiX "file not found".
+          $expected = @('avcodec-63.dll','avformat-63.dll','avutil-61.dll','swresample-7.dll','swscale-10.dll')
+          foreach ($d in $expected) {
+            if (-not (Test-Path "$root\bin\$d")) {
+              throw "FFmpeg DLL '$d' not found in $root\bin — the gyan release likely bumped soname versions. Update wix/main.wxs and this list to the DLLs actually present."
+            }
+          }
+          echo "FFMPEG_DIR=$root" >> $env:GITHUB_ENV
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          echo "FFMPEG_BIN=$root\bin" >> $env:GITHUB_ENV
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix
+
+      # Windows build needs DXIL shaders; build.rs transpiles SPIR-V via shadercross.
+      # SDL_shadercross ships no binaries, so install it through vcpkg (which pulls
+      # a prebuilt DXC + SDL3 + SPIRV-Cross and exposes the `shadercross` tool).
+      - name: Install SDL_shadercross
+        shell: pwsh
+        run: |
+          $vcpkg = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
+          & "$vcpkg\vcpkg.exe" install sdl3-shadercross --triplet x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg failed to install sdl3-shadercross" }
+          $tool = Get-ChildItem -Path "$vcpkg\installed" -Recurse -Filter shadercross.exe | Select-Object -First 1
+          if (-not $tool) { throw "shadercross.exe not found after vcpkg install" }
+          echo "$($tool.DirectoryName)" >> $env:GITHUB_PATH
+          $bin = Join-Path $tool.Directory.Parent.Parent.FullName "bin"
+          if (Test-Path $bin) { echo "$bin" >> $env:GITHUB_PATH }
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage FFmpeg DLLs next to the binary
+        shell: pwsh
+        run: |
+          # wix/main.wxs sources the DLLs from $(var.CargoTargetBinDir) (=target\release).
+          Copy-Item "$env:FFMPEG_BIN\*.dll" "target/release/" -Force
+
+      - name: Build MSI
+        run: |
+          # If wix/main.wxs does not exist, init it
+          if [ ! -d "wix" ]; then
+            echo "Wix configuration not found, initializing defaults..."
+            cargo wix init
+          fi
+          # --no-build: the binary + bundled DLLs are already staged above, and
+          # the committed wix/main.wxs references those DLLs.
+          cargo wix --no-build --nocapture
+
+      - name: Archive MSI
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-msi
+          path: target/wix/*.msi
+
+  build-deb:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ./target
+          key: deb-cargo-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build Debian package
+        run: cargo deb
+
+      - name: Archive Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-deb
+          path: target/debian/*.deb
+
+  build-appimage:
+    name: Build Linux AppImage
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libasound2-dev pkg-config clang libclang-dev cmake libx11-dev libxext-dev libxrender-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxtst-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols fuse libfuse2 desktop-file-utils
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ./target
+          key: appimage-cargo-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Stage AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          install -m 755 target/release/lightningview AppDir/usr/bin/lightningview
+          install -m 644 lightningview.desktop AppDir/usr/share/applications/lightningview.desktop
+          install -m 644 lightningview.png AppDir/usr/share/icons/hicolor/256x256/apps/lightningview.png
+
+          # Top-level icon + .desktop are required by AppImage tooling
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/lightningview.png AppDir/lightningview.png
+          cp AppDir/usr/share/applications/lightningview.desktop AppDir/lightningview.desktop
+
+      - name: Download linuxdeploy
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+
+      - name: Build AppImage
+        env:
+          # GitHub Actions runners do not always allow FUSE; extract and run instead.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          # The appimage plugin uses LDAI_OUTPUT (newer) / OUTPUT (deprecated)
+          # to set the resulting filename directly — no post-rename needed.
+          LDAI_OUTPUT: LightningView-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-x86_64.AppImage
+        run: |
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --desktop-file AppDir/usr/share/applications/lightningview.desktop \
+            --icon-file AppDir/lightningview.png \
+            --output appimage
+
+      - name: Archive AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-appimage
+          # Match only LightningView-prefixed AppImages so the linuxdeploy
+          # tool itself does not end up in the artifact.
+          path: ./LightningView-*.AppImage
+
+  build-chocolatey:
+    name: Build Chocolatey package
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF_TYPE == "tag" ]]; then
+            # Strip a leading "v" if present (e.g. v2.4.6 -> 2.4.6)
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          fi
+          echo "version=$VER" >> $GITHUB_OUTPUT
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: result-x86_64-pc-windows-msvc
+          path: ./win-zip
+
+      - name: Compute zip checksum
+        id: sum
+        shell: bash
+        run: |
+          ZIP=$(ls ./win-zip/*.zip | head -n1)
+          if [[ -z "$ZIP" ]]; then
+            echo "No Windows zip found in ./win-zip" >&2
+            exit 1
+          fi
+          SUM=$(sha256sum "$ZIP" | awk '{print toupper($1)}')
+          echo "checksum=$SUM" >> $GITHUB_OUTPUT
+
+      - name: Stamp nuspec and install script
+        shell: bash
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+          SUM: ${{ steps.sum.outputs.checksum }}
+        run: |
+          sed -i "s|@@VERSION@@|${VER}|g" packaging/chocolatey/lightningview.nuspec
+          sed -i "s|@@VERSION@@|${VER}|g" packaging/chocolatey/tools/chocolateyinstall.ps1
+          sed -i "s|@@CHECKSUM64@@|${SUM}|g" packaging/chocolatey/tools/chocolateyinstall.ps1
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          cd packaging/chocolatey
+          choco pack lightningview.nuspec --out ../../
+
+      - name: Archive Chocolatey package
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-chocolatey
+          path: ./*.nupkg
+
+  build-flatpak:
+    name: Build Linux Flatpak
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Flatpak Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder elfutils
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          # 25.08 is required because rust-stable//24.08 ships rustc 1.89,
+          # which is below egui 0.34's 1.92 MSRV. 25.08 ships rustc 1.94.
+          sudo flatpak install -y flathub org.freedesktop.Sdk//25.08 \
+                                          org.freedesktop.Platform//25.08 \
+                                          org.freedesktop.Sdk.Extension.rust-stable//25.08 \
+                                          org.freedesktop.Sdk.Extension.llvm20//25.08
+
+      - name: Vendor Cargo dependencies
+        run: |
+          # Re-resolve so the lockfile reflects the current Cargo.toml.
+          rm -f Cargo.lock
+          cargo generate-lockfile
+
+          # `cargo vendor` writes the correct source-replacement config for
+          # crates.io AND every git dep (including the two rawler revs) to
+          # stdout. Don't append anything else — that's what broke the build
+          # before. stderr carries progress messages and must NOT go into
+          # config.toml.
+          mkdir -p .cargo
+          cargo vendor > .cargo/config.toml 2>/dev/null
+
+      - name: Build Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: lightningview.flatpak
+          manifest-path: io.github.dividebysandwich.lightningview.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          # The action uploads the bundle itself by default, as an artifact
+          # named after the bundle + arch. That is a second copy of the very
+          # same lightningview.flatpak the Archive step below publishes as
+          # result-flatpak, and the deploy job would then try to attach two
+          # assets with the same file name to the release (the second upload
+          # fails). Let the explicit Archive step own the artifact.
+          upload-artifact: false
+
+      - name: Archive Flatpak Bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-flatpak
+          path: lightningview.flatpak
+
+  deploy:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-deb, build-msi, build-appimage, build-chocolatey, build-flatpak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          # Only the artifacts the build jobs publish for release. Guards
+          # against any action that uploads a bundle of its own accord and
+          # would otherwise duplicate a release asset file name.
+          pattern: result-*
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+           files: |
+            ./artifacts/*/*.tar.gz
+            ./artifacts/*/*.zip
+            ./artifacts/*/*.deb
+            ./artifacts/*/*.msi
+            ./artifacts/*/*.AppImage
+            ./artifacts/*/*.nupkg
+            ./artifacts/*/*.flatpak

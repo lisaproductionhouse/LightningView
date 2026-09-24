@@ -329,12 +329,6 @@ pub struct ImageViewerApp {
     is_randomized: bool,
     show_delete_confirmation: bool,
     last_error: Option<String>,
-    /// TEMPORARY diagnostic text, drawn in the top-left corner regardless of
-    /// what else is on screen (unlike `last_error`, which is hidden once an
-    /// image is showing). Set by `perform_delete` so its before/after state is
-    /// visible without needing `/debug` console output. Remove once the
-    /// delete-advances-to-the-wrong-image issue is tracked down.
-    debug_overlay: Option<String>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
@@ -392,7 +386,6 @@ impl ImageViewerApp {
             is_randomized: false,
             show_delete_confirmation: false,
             last_error: None,
-            debug_overlay: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
@@ -849,12 +842,6 @@ impl ImageViewerApp {
         let Some(path) = self.image_files.get(self.image_order[self.current_index]).cloned() else {
             return;
         };
-        let before_summary = format!(
-            "idx={} del={:?} order={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-        );
         log::info!(
             "perform_delete: BEFORE current_index={} deleting={:?} order={:?} files={:?}",
             self.current_index,
@@ -885,27 +872,17 @@ impl ImageViewerApp {
             }
         }
         if self.image_files.is_empty() {
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  (list now empty)"));
             self.should_quit = true;
         } else {
             self.current_index %= self.image_files.len();
-            let after_showing = self
-                .image_files
-                .get(self.image_order[self.current_index])
-                .and_then(|p| p.file_name());
-            let after_summary = format!(
-                "idx={} order={:?} showing={:?}",
-                self.current_index,
-                self.image_order,
-                after_showing,
-            );
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  {after_summary}"));
             log::info!(
                 "perform_delete: AFTER current_index={} order={:?} files={:?} now_showing={:?}",
                 self.current_index,
                 self.image_order,
                 self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-                after_showing,
+                self.image_files
+                    .get(self.image_order[self.current_index])
+                    .and_then(|p| p.file_name()),
             );
             self.load_image_at_index(self.current_index, renderer);
         }
@@ -1417,17 +1394,6 @@ impl ImageViewerApp {
                 None => "Loading…".to_string(),
             };
             renderer.draw_text(&label, 18.0, area.center(), TextAlign::Center, gray(180));
-        }
-
-        // TEMPORARY: diagnostic overlay for the delete-advances-to-the-wrong-
-        // image issue. Drawn unconditionally (unlike `last_error` above, which
-        // only shows when no image is loaded) so it's visible right over the
-        // newly-loaded image. Remove once that's tracked down.
-        if let Some(overlay) = &self.debug_overlay {
-            for (i, line) in overlay.split('\n').enumerate() {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + i as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(255, 230, 60, 255));
-            }
         }
 
         if self.show_delete_confirmation {

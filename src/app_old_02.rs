@@ -289,29 +289,12 @@ fn move_to_delete_folder(path: &Path) -> std::io::Result<PathBuf> {
     Ok(dest)
 }
 
-/// The fit-to-window transform captured when a 1:1 peek starts: used as a
-/// fixed reference so the cursor keeps mapping to the same position in the
-/// image for the whole gesture, no matter how far the peek's own offset has
-/// since panned. See `ImageViewerApp::peeking` and `update_peek_offset`.
-#[derive(Clone, Copy)]
-struct PeekAnchor {
-    fit_zoom: f32,
-    fit_offset: Vec2,
-}
-
-/// Clamp `offset` so an image of size `img` can't be panned past its own
-/// edges within a `view`-sized viewport: centered on any axis where the image
-/// is smaller than the view, else confined to `[view_dim - img_dim, 0]` (the
-/// same bounds the idle "bounce back" physics settles toward).
-fn clamp_offset_to_bounds(offset: Vec2, view: Vec2, img: Vec2) -> Vec2 {
-    fn axis(offset: f32, view_dim: f32, img_dim: f32) -> f32 {
-        if img_dim <= view_dim {
-            (view_dim - img_dim) / 2.0
-        } else {
-            offset.clamp(view_dim - img_dim, 0.0)
-        }
-    }
-    Vec2::new(axis(offset.x, view.x, img.x), axis(offset.y, view.y, img.y))
+/// View state saved when a middle-click "peek at 1:1" starts, so releasing
+/// the button can restore exactly what was on screen before.
+struct ZoomPeek {
+    zoom: f32,
+    offset: Vec2,
+    is_scaled_to_fit: bool,
 }
 
 pub struct ImageViewerApp {
@@ -329,12 +312,6 @@ pub struct ImageViewerApp {
     is_randomized: bool,
     show_delete_confirmation: bool,
     last_error: Option<String>,
-    /// TEMPORARY diagnostic text, drawn in the top-left corner regardless of
-    /// what else is on screen (unlike `last_error`, which is hidden once an
-    /// image is showing). Set by `perform_delete` so its before/after state is
-    /// visible without needing `/debug` console output. Remove once the
-    /// delete-advances-to-the-wrong-image issue is tracked down.
-    debug_overlay: Option<String>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
@@ -343,22 +320,13 @@ pub struct ImageViewerApp {
     memory_gate: Arc<MemoryGate>,
     /// Configurable key bindings for video seeking and file browsing.
     keybindings: KeyBindings,
-    /// Whether to show a confirmation dialog before deleting (see `config.rs`).
-    confirm_delete: bool,
 
     // --- input state (event-driven) ---
     mouse_pos: Vec2,
-    /// `Some` while the left button is held to peek at 1:1 — only entered from
-    /// the default fit-to-window view. Holds the fit transform captured at the
-    /// start of the gesture (see `PeekAnchor`/`update_peek_offset`). See
-    /// `dragging` for the left button's behavior once the image is already
-    /// manually zoomed.
-    peeking: Option<PeekAnchor>,
-    /// True while the left button drags a manually-zoomed image (hand-tool
-    /// style pan, content follows the cursor with a bit of fling momentum).
-    /// Only entered when `is_scaled_to_fit` is already false; at the default
-    /// fit view the left button peeks instead — see `peeking`.
     dragging: bool,
+    /// `Some` while the middle mouse button is held to peek at 1:1; holds the
+    /// view to restore when it's released. See `ZoomPeek`.
+    zoom_peek: Option<ZoomPeek>,
     /// Set when a drag/zoom happened this frame; suppresses the bounce physics
     /// for that frame (mirrors the old `is_interacting`).
     interacted: bool,
@@ -375,9 +343,7 @@ impl ImageViewerApp {
     pub fn new(path: Option<PathBuf>, initial_fullscreen: bool, renderer: &Renderer) -> Self {
         let memory_gate = Arc::new(MemoryGate::new());
         let full_res_worker = Some(spawn_full_res_worker(memory_gate.clone()));
-        let config = crate::config::Config::load();
-        let keybindings = config.keybindings;
-        let confirm_delete = config.confirm_delete;
+        let keybindings = crate::config::Config::load().keybindings;
         let mut app = Self {
             image: None,
             video: None,
@@ -392,7 +358,6 @@ impl ImageViewerApp {
             is_randomized: false,
             show_delete_confirmation: false,
             last_error: None,
-            debug_overlay: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
@@ -400,10 +365,9 @@ impl ImageViewerApp {
             preload_state: None,
             memory_gate,
             keybindings,
-            confirm_delete,
             mouse_pos: Vec2::ZERO,
-            peeking: None,
             dragging: false,
+            zoom_peek: None,
             interacted: false,
             context_menu: None,
             scrubbing: false,
@@ -435,8 +399,7 @@ impl ImageViewerApp {
 
         self.is_scaled_to_fit = true;
         self.velocity = Vec2::ZERO;
-        self.peeking = None;
-        self.dragging = false;
+        self.zoom_peek = None;
         self.full_res_pending = false;
         self.full_res_pending_since = None;
 
@@ -849,19 +812,6 @@ impl ImageViewerApp {
         let Some(path) = self.image_files.get(self.image_order[self.current_index]).cloned() else {
             return;
         };
-        let before_summary = format!(
-            "idx={} del={:?} order={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-        );
-        log::info!(
-            "perform_delete: BEFORE current_index={} deleting={:?} order={:?} files={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-            self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-        );
         // Compute the cache path before moving — the hash needs the file's size/mtime.
         let cache_path = preload_cache_path(&path);
         let dest = match move_to_delete_folder(&path) {
@@ -885,28 +835,9 @@ impl ImageViewerApp {
             }
         }
         if self.image_files.is_empty() {
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  (list now empty)"));
             self.should_quit = true;
         } else {
             self.current_index %= self.image_files.len();
-            let after_showing = self
-                .image_files
-                .get(self.image_order[self.current_index])
-                .and_then(|p| p.file_name());
-            let after_summary = format!(
-                "idx={} order={:?} showing={:?}",
-                self.current_index,
-                self.image_order,
-                after_showing,
-            );
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  {after_summary}"));
-            log::info!(
-                "perform_delete: AFTER current_index={} order={:?} files={:?} now_showing={:?}",
-                self.current_index,
-                self.image_order,
-                self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-                after_showing,
-            );
             self.load_image_at_index(self.current_index, renderer);
         }
     }
@@ -935,29 +866,6 @@ impl ImageViewerApp {
             v.bump_controls();
         }
         true
-    }
-
-    /// Re-center the 1:1 peek view on `cursor`. Maps the cursor to a position
-    /// in the image using the fit-to-window transform captured when the peek
-    /// started (`self.peeking`) — a *fixed* reference, so the cursor keeps
-    /// mapping to the same position in the image for the whole gesture no
-    /// matter how far the peek's own (1:1) offset has since panned. That's
-    /// what lets one continuous hold reach every part of the image — portrait
-    /// or landscape — since a fixed relative-delta pan could run out of
-    /// screen to move the mouse across before covering a tall or wide image.
-    /// The result is clamped so the image always covers the viewport (never
-    /// shows blank space past its own edges).
-    fn update_peek_offset(&mut self, cursor: Vec2, renderer: &Renderer) {
-        let Some(anchor) = self.peeking else { return };
-        let Some(image) = &self.image else { return };
-        let image_point = (cursor - anchor.fit_offset) / anchor.fit_zoom;
-        let raw_offset = cursor - image_point * MIN_ZOOM;
-        let img_size = Vec2::new(
-            image.full_res_image.width() as f32,
-            image.full_res_image.height() as f32,
-        ) * MIN_ZOOM;
-        let view = renderer.drawable_size();
-        self.offset = clamp_offset_to_bounds(raw_offset, view, img_size);
     }
 
     // --- Event handling ------------------------------------------------------
@@ -997,23 +905,8 @@ impl ImageViewerApp {
                     }
                 } else if self.try_start_scrub(p, area) {
                     // Grabbed the seek-bar marker; scrubbing handled on motion/up.
-                } else if self.image.is_some() {
-                    if self.is_scaled_to_fit {
-                        // At the default fit view: hold to peek at 1:1. Capture the
-                        // current fit transform as a fixed reference for the whole
-                        // gesture (see `update_peek_offset`), then jump to native
-                        // size anchored on the click point.
-                        self.peeking = Some(PeekAnchor { fit_zoom: self.zoom, fit_offset: self.offset });
-                        self.zoom = MIN_ZOOM;
-                        self.update_peek_offset(p, renderer);
-                        self.is_scaled_to_fit = false;
-                        self.velocity = Vec2::ZERO;
-                        self.interacted = true;
-                    } else {
-                        // Already zoomed in by hand: plain click-and-drag pans,
-                        // hand-tool style, instead of peeking.
-                        self.dragging = true;
-                    }
+                } else {
+                    self.dragging = true;
                 }
             }
             Event::MouseButtonDown { mouse_btn: MouseButton::Right, x, y, .. } => {
@@ -1024,17 +917,24 @@ impl ImageViewerApp {
                     self.context_menu = Some(p);
                 }
             }
-            Event::MouseButtonDown { mouse_btn: MouseButton::Middle, .. } => {
-                // Same action as the Delete key: respects `confirm_delete`.
-                // Native binding (rather than an external mouse-remap sending a
-                // synthetic key) so nothing about the remap's exact event
-                // timing/sequence can interfere.
-                if !self.show_delete_confirmation && self.context_menu.is_none() {
-                    if self.confirm_delete {
-                        self.show_delete_confirmation = true;
-                    } else {
-                        self.perform_delete(renderer);
-                    }
+            Event::MouseButtonDown { mouse_btn: MouseButton::Middle, x, y, .. } => {
+                // Peek at 1:1: jump the zoom to native size anchored on the click
+                // point, remembering the current view so releasing snaps back to it.
+                if self.image.is_some() && !self.show_delete_confirmation && self.context_menu.is_none() {
+                    let p = Vec2::new(*x, *y);
+                    self.mouse_pos = p;
+                    self.zoom_peek = Some(ZoomPeek {
+                        zoom: self.zoom,
+                        offset: self.offset,
+                        is_scaled_to_fit: self.is_scaled_to_fit,
+                    });
+                    let old_zoom = self.zoom;
+                    let image_coords = (p - self.offset) / old_zoom;
+                    self.zoom = MIN_ZOOM;
+                    self.offset -= image_coords * (self.zoom - old_zoom);
+                    self.is_scaled_to_fit = false;
+                    self.velocity = Vec2::ZERO;
+                    self.interacted = true;
                 }
             }
             Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
@@ -1046,15 +946,17 @@ impl ImageViewerApp {
                         v.seek_to_fraction(frac as f64);
                     }
                 }
-                if self.peeking.take().is_some() {
-                    // End the peek: back to the normal fit-to-window view, the
-                    // same state a freshly opened image starts in.
-                    self.is_scaled_to_fit = true;
-                    self.velocity = Vec2::ZERO;
-                }
-                // No velocity reset here: a hand-tool drag keeps its momentum so
-                // the image can fling/settle after release, same as before.
                 self.dragging = false;
+            }
+            Event::MouseButtonUp { mouse_btn: MouseButton::Middle, .. } => {
+                // End the peek: snap straight back to the view it interrupted.
+                if let Some(saved) = self.zoom_peek.take() {
+                    self.zoom = saved.zoom;
+                    self.offset = saved.offset;
+                    self.is_scaled_to_fit = saved.is_scaled_to_fit;
+                    self.velocity = Vec2::ZERO;
+                    self.interacted = true;
+                }
             }
             Event::MouseMotion { x, y, xrel, yrel, .. } => {
                 let p = Vec2::new(*x, *y);
@@ -1069,20 +971,17 @@ impl ImageViewerApp {
                     if let Some(g) = seek_bar_geom(area) {
                         self.scrub_frac = seek_bar_frac_at(&g, p.x);
                     }
-                } else if self.peeking.is_some() {
-                    // Magnifying-glass tracking: re-map the cursor to a position in
-                    // the image (see `update_peek_offset`) instead of accumulating a
-                    // relative drag delta — content follows opposite to the cursor's
-                    // motion, and every part of the image is reachable within one
-                    // continuous hold no matter its aspect ratio.
-                    self.update_peek_offset(p, renderer);
-                    self.interacted = true;
-                } else if self.dragging && self.image.is_some() {
-                    // Hand-tool pan for an already manually-zoomed image: content
-                    // follows the cursor directly, with a bit of fling momentum.
+                } else if self.zoom_peek.is_some() {
+                    // Track the cursor 1:1 while peeking (zoom stays locked at native size).
                     let delta = Vec2::new(*xrel, *yrel);
                     self.offset += delta;
+                    self.interacted = true;
+                } else if self.dragging && self.image.is_some() {
+                    let delta = Vec2::new(*xrel, *yrel);
+                    self.offset += delta;
+                    // Smooth momentum over the recent gesture.
                     self.velocity = self.velocity * 0.4 + delta * 0.6;
+                    self.is_scaled_to_fit = false;
                     self.interacted = true;
                 }
             }
@@ -1202,13 +1101,7 @@ impl ImageViewerApp {
                 self.is_fullscreen = !self.is_fullscreen;
             }
             Keycode::Return => self.is_scaled_to_fit = !self.is_scaled_to_fit,
-            Keycode::Delete => {
-                if self.confirm_delete {
-                    self.show_delete_confirmation = true;
-                } else {
-                    self.perform_delete(renderer);
-                }
-            }
+            Keycode::Delete => self.show_delete_confirmation = true,
             _ => {}
         }
     }
@@ -1296,10 +1189,10 @@ impl ImageViewerApp {
                 self.offset = (area.size() - fit_size) * 0.5;
                 self.velocity = Vec2::ZERO;
             } else {
-                if self.peeking.is_none() && !self.dragging {
+                if !self.dragging {
                     self.offset += self.velocity;
                 }
-                let interacting = self.peeking.is_some() || self.dragging || self.interacted;
+                let interacting = self.dragging || self.interacted || self.zoom_peek.is_some();
                 if !interacting {
                     let screen_size = area.size();
                     let scaled = full_res_size * self.zoom;
@@ -1417,17 +1310,6 @@ impl ImageViewerApp {
                 None => "Loading…".to_string(),
             };
             renderer.draw_text(&label, 18.0, area.center(), TextAlign::Center, gray(180));
-        }
-
-        // TEMPORARY: diagnostic overlay for the delete-advances-to-the-wrong-
-        // image issue. Drawn unconditionally (unlike `last_error` above, which
-        // only shows when no image is loaded) so it's visible right over the
-        // newly-loaded image. Remove once that's tracked down.
-        if let Some(overlay) = &self.debug_overlay {
-            for (i, line) in overlay.split('\n').enumerate() {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + i as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(255, 230, 60, 255));
-            }
         }
 
         if self.show_delete_confirmation {
@@ -1624,7 +1506,6 @@ impl ImageViewerApp {
             }
         }
         self.full_res_pending
-            || self.peeking.is_some()
             || self.dragging
             || self.scrubbing
             || self.velocity.length_sq() > 0.01

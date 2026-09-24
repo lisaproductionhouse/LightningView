@@ -613,7 +613,7 @@ jobs:
 
   deploy:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, build-deb, build-msi, build-appimage, build-chocolatey, build-flatpak]
+    needs: [build, build-deb, build-appimage, build-chocolatey, build-flatpak]
     runs-on: ubuntu-latest
     permissions:
       contents: write

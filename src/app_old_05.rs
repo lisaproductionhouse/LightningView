@@ -329,12 +329,6 @@ pub struct ImageViewerApp {
     is_randomized: bool,
     show_delete_confirmation: bool,
     last_error: Option<String>,
-    /// TEMPORARY diagnostic text, drawn in the top-left corner regardless of
-    /// what else is on screen (unlike `last_error`, which is hidden once an
-    /// image is showing). Set by `perform_delete` so its before/after state is
-    /// visible without needing `/debug` console output. Remove once the
-    /// delete-advances-to-the-wrong-image issue is tracked down.
-    debug_overlay: Option<String>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
@@ -343,8 +337,6 @@ pub struct ImageViewerApp {
     memory_gate: Arc<MemoryGate>,
     /// Configurable key bindings for video seeking and file browsing.
     keybindings: KeyBindings,
-    /// Whether to show a confirmation dialog before deleting (see `config.rs`).
-    confirm_delete: bool,
 
     // --- input state (event-driven) ---
     mouse_pos: Vec2,
@@ -375,9 +367,7 @@ impl ImageViewerApp {
     pub fn new(path: Option<PathBuf>, initial_fullscreen: bool, renderer: &Renderer) -> Self {
         let memory_gate = Arc::new(MemoryGate::new());
         let full_res_worker = Some(spawn_full_res_worker(memory_gate.clone()));
-        let config = crate::config::Config::load();
-        let keybindings = config.keybindings;
-        let confirm_delete = config.confirm_delete;
+        let keybindings = crate::config::Config::load().keybindings;
         let mut app = Self {
             image: None,
             video: None,
@@ -392,7 +382,6 @@ impl ImageViewerApp {
             is_randomized: false,
             show_delete_confirmation: false,
             last_error: None,
-            debug_overlay: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
@@ -400,7 +389,6 @@ impl ImageViewerApp {
             preload_state: None,
             memory_gate,
             keybindings,
-            confirm_delete,
             mouse_pos: Vec2::ZERO,
             peeking: None,
             dragging: false,
@@ -843,25 +831,29 @@ impl ImageViewerApp {
         }
     }
 
-    /// Move the current file into `_DELETE` (after confirmation) and advance.
+    /// Move the current file into `_DELETE` (after confirmation) and advance to
+    /// the next image in the browsing order — wrapping to the first image if
+    /// the deleted one was last. The next file is remembered by its own path
+    /// (not by index) so the advance always lands on the right file, regardless
+    /// of how removing the current entry shifts everyone else's indices.
     fn perform_delete(&mut self, renderer: &Renderer) {
         self.show_delete_confirmation = false;
-        let Some(path) = self.image_files.get(self.image_order[self.current_index]).cloned() else {
+        let Some(&removed_order_index) = self.image_order.get(self.current_index) else {
             return;
         };
-        let before_summary = format!(
-            "idx={} del={:?} order={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-        );
-        log::info!(
-            "perform_delete: BEFORE current_index={} deleting={:?} order={:?} files={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-            self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-        );
+        let Some(path) = self.image_files.get(removed_order_index).cloned() else {
+            return;
+        };
+        // Remember which file to show next (by path) before anything shifts:
+        // whatever currently follows this one in the browsing order, wrapping
+        // to the first entry if this is the last one.
+        let next_order_pos = (self.current_index + 1) % self.image_order.len();
+        let next_file_index: Option<usize> = self.image_order.get(next_order_pos).copied();
+        let next_path: Option<PathBuf> = match next_file_index {
+            Some(i) => self.image_files.get(i).cloned(),
+            None => None,
+        };
+
         // Compute the cache path before moving — the hash needs the file's size/mtime.
         let cache_path = preload_cache_path(&path);
         let dest = match move_to_delete_folder(&path) {
@@ -877,7 +869,7 @@ impl ImageViewerApp {
                 log::warn!("Failed to delete preload cache {}: {}", cache_path.display(), e);
             }
         }
-        let removed_order_index = self.image_order.remove(self.current_index);
+        self.image_order.remove(self.current_index);
         self.image_files.remove(removed_order_index);
         for order_idx in self.image_order.iter_mut() {
             if *order_idx > removed_order_index {
@@ -885,30 +877,24 @@ impl ImageViewerApp {
             }
         }
         if self.image_files.is_empty() {
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  (list now empty)"));
             self.should_quit = true;
-        } else {
-            self.current_index %= self.image_files.len();
-            let after_showing = self
-                .image_files
-                .get(self.image_order[self.current_index])
-                .and_then(|p| p.file_name());
-            let after_summary = format!(
-                "idx={} order={:?} showing={:?}",
-                self.current_index,
-                self.image_order,
-                after_showing,
-            );
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  {after_summary}"));
-            log::info!(
-                "perform_delete: AFTER current_index={} order={:?} files={:?} now_showing={:?}",
-                self.current_index,
-                self.image_order,
-                self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-                after_showing,
-            );
-            self.load_image_at_index(self.current_index, renderer);
+            return;
         }
+        // Find where the remembered next file ended up; if it can't be found
+        // (shouldn't happen — we didn't touch it), fall back to whatever now
+        // sits closest to where we were.
+        let mut new_current_index = self.current_index.min(self.image_order.len() - 1);
+        if let Some(p) = next_path {
+            let file_idx = self.image_files.iter().position(|f| f == &p);
+            if let Some(file_idx) = file_idx {
+                let order_idx = self.image_order.iter().position(|&i| i == file_idx);
+                if let Some(order_idx) = order_idx {
+                    new_current_index = order_idx;
+                }
+            }
+        }
+        self.current_index = new_current_index;
+        self.load_image_at_index(self.current_index, renderer);
     }
 
     /// If the seek bar is currently visible and `p` lands on its clickable band,
@@ -1022,19 +1008,6 @@ impl ImageViewerApp {
                 // Open the context menu (only over image/video, not a modal).
                 if !self.show_delete_confirmation {
                     self.context_menu = Some(p);
-                }
-            }
-            Event::MouseButtonDown { mouse_btn: MouseButton::Middle, .. } => {
-                // Same action as the Delete key: respects `confirm_delete`.
-                // Native binding (rather than an external mouse-remap sending a
-                // synthetic key) so nothing about the remap's exact event
-                // timing/sequence can interfere.
-                if !self.show_delete_confirmation && self.context_menu.is_none() {
-                    if self.confirm_delete {
-                        self.show_delete_confirmation = true;
-                    } else {
-                        self.perform_delete(renderer);
-                    }
                 }
             }
             Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
@@ -1202,13 +1175,7 @@ impl ImageViewerApp {
                 self.is_fullscreen = !self.is_fullscreen;
             }
             Keycode::Return => self.is_scaled_to_fit = !self.is_scaled_to_fit,
-            Keycode::Delete => {
-                if self.confirm_delete {
-                    self.show_delete_confirmation = true;
-                } else {
-                    self.perform_delete(renderer);
-                }
-            }
+            Keycode::Delete => self.show_delete_confirmation = true,
             _ => {}
         }
     }
@@ -1417,17 +1384,6 @@ impl ImageViewerApp {
                 None => "Loading…".to_string(),
             };
             renderer.draw_text(&label, 18.0, area.center(), TextAlign::Center, gray(180));
-        }
-
-        // TEMPORARY: diagnostic overlay for the delete-advances-to-the-wrong-
-        // image issue. Drawn unconditionally (unlike `last_error` above, which
-        // only shows when no image is loaded) so it's visible right over the
-        // newly-loaded image. Remove once that's tracked down.
-        if let Some(overlay) = &self.debug_overlay {
-            for (i, line) in overlay.split('\n').enumerate() {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + i as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(255, 230, 60, 255));
-            }
         }
 
         if self.show_delete_confirmation {

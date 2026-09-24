@@ -53,11 +53,6 @@ impl Default for KeyBindings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Show a confirmation dialog before deleting (moving a file into
-    /// `_DELETE`). Off by default: since deleting only moves the file into a
-    /// `_DELETE` subfolder rather than destroying it, there's nothing
-    /// irreversible to confirm.
-    pub confirm_delete: bool,
     pub keybindings: KeyBindings,
 }
 
@@ -65,12 +60,6 @@ pub struct Config {
 /// self-documenting.
 const CONFIG_HEADER: &str = "\
 # LightningView configuration
-#
-# confirm_delete = true/false
-#   Show a confirmation dialog before deleting (moving a file to the
-#   per-folder _DELETE subfolder). Default: false — since deleting only moves
-#   the file into _DELETE rather than destroying it, no confirmation is
-#   required by default. Set to true to be asked every time.
 #
 # [keybindings]
 #   video_seek  = key pair that seeks within a playing video

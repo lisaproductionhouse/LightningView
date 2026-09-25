@@ -329,16 +329,6 @@ pub struct ImageViewerApp {
     is_randomized: bool,
     show_delete_confirmation: bool,
     last_error: Option<String>,
-    /// TEMPORARY diagnostic text, drawn in the top-left corner regardless of
-    /// what else is on screen (unlike `last_error`, which is hidden once an
-    /// image is showing). Set by `perform_delete` so its before/after state is
-    /// visible without needing `/debug` console output. Remove once the
-    /// delete-advances-to-the-wrong-image issue is tracked down.
-    debug_overlay: Option<String>,
-    /// TEMPORARY: which branch `load_image_at_index` took (cache / embedded
-    /// thumbnail / async) and, once it lands, what the async decode reply
-    /// actually contained. Drawn just below `debug_overlay`.
-    debug_load_overlay: Option<String>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
@@ -396,8 +386,6 @@ impl ImageViewerApp {
             is_randomized: false,
             show_delete_confirmation: false,
             last_error: None,
-            debug_overlay: None,
-            debug_load_overlay: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
@@ -447,11 +435,6 @@ impl ImageViewerApp {
 
         // Video files bypass the image decode/cache/tile pipeline entirely.
         if is_video_file(&path) {
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=VIDEO",
-                index,
-                path.file_name()
-            ));
             self.video = None;
             self.image = None;
             match VideoState::open(&path) {
@@ -476,13 +459,6 @@ impl ImageViewerApp {
                 path.display(),
                 start_time.elapsed()
             );
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=CACHE {}x{}",
-                index,
-                path.file_name(),
-                preview.width(),
-                preview.height()
-            ));
             self.display_loaded_image(preview, renderer);
             self.start_full_res_load(path, renderer);
         } else if let Some(thumb) = load_embedded_thumbnail(&path) {
@@ -491,23 +467,11 @@ impl ImageViewerApp {
                 path.display(),
                 start_time.elapsed()
             );
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=THUMB {}x{}",
-                index,
-                path.file_name(),
-                thumb.width(),
-                thumb.height()
-            ));
             self.display_loaded_image(to_pixel_buf(thumb), renderer);
             self.start_full_res_load(path, renderer);
         } else {
             // No preview available; route the decode through the worker and show a
             // "Loading…" placeholder until the reply arrives.
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=ASYNC(pending)",
-                index,
-                path.file_name()
-            ));
             self.image = None;
             self.last_error = None;
             self.start_full_res_load(path, renderer);
@@ -670,15 +634,6 @@ impl ImageViewerApp {
                             self.display_animated_image(frames, renderer)
                         }
                     }
-                    let kind = if reply.is_preview { "ASYNC-preview" } else { "ASYNC-full" };
-                    self.debug_load_overlay = Some(format!(
-                        "LOAD idx={} path={:?} via={} {}x{}",
-                        self.current_index,
-                        reply.path.file_name(),
-                        kind,
-                        new_width as u32,
-                        new_height as u32,
-                    ));
                     if reply.is_preview {
                         log::info!("Showed fast preview for: {}", reply.path.display());
                     } else {
@@ -887,19 +842,6 @@ impl ImageViewerApp {
         let Some(path) = self.image_files.get(self.image_order[self.current_index]).cloned() else {
             return;
         };
-        let before_summary = format!(
-            "idx={} del={:?} order={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-        );
-        log::info!(
-            "perform_delete: BEFORE current_index={} deleting={:?} order={:?} files={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-            self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-        );
         // Compute the cache path before moving — the hash needs the file's size/mtime.
         let cache_path = preload_cache_path(&path);
         let dest = match move_to_delete_folder(&path) {
@@ -923,28 +865,9 @@ impl ImageViewerApp {
             }
         }
         if self.image_files.is_empty() {
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  (list now empty)"));
             self.should_quit = true;
         } else {
             self.current_index %= self.image_files.len();
-            let after_showing = self
-                .image_files
-                .get(self.image_order[self.current_index])
-                .and_then(|p| p.file_name());
-            let after_summary = format!(
-                "idx={} order={:?} showing={:?}",
-                self.current_index,
-                self.image_order,
-                after_showing,
-            );
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  {after_summary}"));
-            log::info!(
-                "perform_delete: AFTER current_index={} order={:?} files={:?} now_showing={:?}",
-                self.current_index,
-                self.image_order,
-                self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-                after_showing,
-            );
             self.load_image_at_index(self.current_index, renderer);
         }
     }
@@ -1455,26 +1378,6 @@ impl ImageViewerApp {
                 None => "Loading…".to_string(),
             };
             renderer.draw_text(&label, 18.0, area.center(), TextAlign::Center, gray(180));
-        }
-
-        // TEMPORARY: diagnostic overlay for the delete-advances-to-the-wrong-
-        // image issue. Drawn unconditionally (unlike `last_error` above, which
-        // only shows when no image is loaded) so it's visible right over the
-        // newly-loaded image. Remove once that's tracked down.
-        let mut debug_line = 0i32;
-        if let Some(overlay) = &self.debug_overlay {
-            for line in overlay.split('\n') {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + debug_line as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(255, 230, 60, 255));
-                debug_line += 1;
-            }
-        }
-        if let Some(overlay) = &self.debug_load_overlay {
-            for line in overlay.split('\n') {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + debug_line as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(120, 220, 255, 255));
-                debug_line += 1;
-            }
         }
 
         if self.show_delete_confirmation {

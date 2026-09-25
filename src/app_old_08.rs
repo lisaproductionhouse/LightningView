@@ -335,10 +335,6 @@ pub struct ImageViewerApp {
     /// visible without needing `/debug` console output. Remove once the
     /// delete-advances-to-the-wrong-image issue is tracked down.
     debug_overlay: Option<String>,
-    /// TEMPORARY: which branch `load_image_at_index` took (cache / embedded
-    /// thumbnail / async) and, once it lands, what the async decode reply
-    /// actually contained. Drawn just below `debug_overlay`.
-    debug_load_overlay: Option<String>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
@@ -397,7 +393,6 @@ impl ImageViewerApp {
             show_delete_confirmation: false,
             last_error: None,
             debug_overlay: None,
-            debug_load_overlay: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
@@ -447,11 +442,6 @@ impl ImageViewerApp {
 
         // Video files bypass the image decode/cache/tile pipeline entirely.
         if is_video_file(&path) {
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=VIDEO",
-                index,
-                path.file_name()
-            ));
             self.video = None;
             self.image = None;
             match VideoState::open(&path) {
@@ -476,13 +466,6 @@ impl ImageViewerApp {
                 path.display(),
                 start_time.elapsed()
             );
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=CACHE {}x{}",
-                index,
-                path.file_name(),
-                preview.width(),
-                preview.height()
-            ));
             self.display_loaded_image(preview, renderer);
             self.start_full_res_load(path, renderer);
         } else if let Some(thumb) = load_embedded_thumbnail(&path) {
@@ -491,23 +474,11 @@ impl ImageViewerApp {
                 path.display(),
                 start_time.elapsed()
             );
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=THUMB {}x{}",
-                index,
-                path.file_name(),
-                thumb.width(),
-                thumb.height()
-            ));
             self.display_loaded_image(to_pixel_buf(thumb), renderer);
             self.start_full_res_load(path, renderer);
         } else {
             // No preview available; route the decode through the worker and show a
             // "Loading…" placeholder until the reply arrives.
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=ASYNC(pending)",
-                index,
-                path.file_name()
-            ));
             self.image = None;
             self.last_error = None;
             self.start_full_res_load(path, renderer);
@@ -670,15 +641,6 @@ impl ImageViewerApp {
                             self.display_animated_image(frames, renderer)
                         }
                     }
-                    let kind = if reply.is_preview { "ASYNC-preview" } else { "ASYNC-full" };
-                    self.debug_load_overlay = Some(format!(
-                        "LOAD idx={} path={:?} via={} {}x{}",
-                        self.current_index,
-                        reply.path.file_name(),
-                        kind,
-                        new_width as u32,
-                        new_height as u32,
-                    ));
                     if reply.is_preview {
                         log::info!("Showed fast preview for: {}", reply.path.display());
                     } else {
@@ -1461,19 +1423,10 @@ impl ImageViewerApp {
         // image issue. Drawn unconditionally (unlike `last_error` above, which
         // only shows when no image is loaded) so it's visible right over the
         // newly-loaded image. Remove once that's tracked down.
-        let mut debug_line = 0i32;
         if let Some(overlay) = &self.debug_overlay {
-            for line in overlay.split('\n') {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + debug_line as f32 * 22.0);
+            for (i, line) in overlay.split('\n').enumerate() {
+                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + i as f32 * 22.0);
                 renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(255, 230, 60, 255));
-                debug_line += 1;
-            }
-        }
-        if let Some(overlay) = &self.debug_load_overlay {
-            for line in overlay.split('\n') {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + debug_line as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(120, 220, 255, 255));
-                debug_line += 1;
             }
         }
 

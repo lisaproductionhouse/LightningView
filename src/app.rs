@@ -607,24 +607,29 @@ impl ImageViewerApp {
             }
             match reply.result {
                 Ok(loaded) => {
-                    let (new_width, new_height) = match &loaded {
-                        LoadedImage::Static(img) => (img.width() as f32, img.height() as f32),
+                    let new_width = match &loaded {
+                        LoadedImage::Static(img) => img.width() as f32,
                         LoadedImage::Animated(frames) => {
-                            let first = frames.first();
-                            (
-                                first.map(|f| f.image.width()).unwrap_or(0) as f32,
-                                first.map(|f| f.image.height()).unwrap_or(0) as f32,
-                            )
+                            frames.first().map(|f| f.image.width()).unwrap_or(0) as f32
                         }
                     };
                     let preview_width = reply.preview_width as f32;
-                    if preview_width > 0.0 && new_width > 0.0 && !self.is_scaled_to_fit {
-                        // Preserve the user's current view across the preview→full swap,
-                        // without letting the swap itself sneak the zoom under the floor.
-                        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-                        let min_zoom =
-                            fit_zoom(Vec2::new(new_width, new_height), area).min(MIN_ZOOM);
-                        self.zoom = (self.zoom * preview_width / new_width).max(min_zoom);
+                    if preview_width > 0.0
+                        && new_width > 0.0
+                        && !self.is_scaled_to_fit
+                        && self.peeking.is_none()
+                    {
+                        // Preserve the user's current view across the preview→full swap.
+                        // Pure continuity-preserving rescale, no floor clamp: clamping here
+                        // would move the zoom without moving the offset to match, visibly
+                        // shifting/misaligning the frame right as the swap lands. If that
+                        // leaves the zoom briefly under the floor, the next manual zoom
+                        // action settles it back above via the wheel handler's own clamp.
+                        // Skipped entirely while peeking, since a peek's zoom is pinned at
+                        // MIN_ZOOM for the whole gesture (see `update_peek_offset`) and this
+                        // rescale would knock it off that pin without `update_peek_offset`
+                        // knowing to correct for it.
+                        self.zoom *= preview_width / new_width;
                     }
                     match loaded {
                         LoadedImage::Static(full_res) => {

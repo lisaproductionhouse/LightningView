@@ -77,6 +77,19 @@ fn fit_zoom(content: Vec2, area: Rect) -> f32 {
     fit_centered(content, area).width() / content.x
 }
 
+/// The zoom *and* offset that exactly fit `content` within `area` — the same
+/// computation `is_scaled_to_fit` drives `zoom`/`offset` to every frame in
+/// `update()`. Shared so a freshly-displayed image can be put in this state
+/// immediately (see `ImageViewerApp::sync_fit_zoom`), rather than only from
+/// the next frame's `update()` — otherwise a peek or wheel-zoom triggered in
+/// the same event batch as a navigation reads the *previous* image's values.
+fn fit_zoom_and_offset(content: Vec2, area: Rect) -> (f32, Vec2) {
+    let fitted = fit_centered(content, area);
+    let zoom = if content.x > 0.0 { fitted.width() / content.x } else { MIN_ZOOM };
+    let offset = fitted.min - area.min;
+    (zoom, offset)
+}
+
 /// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
 fn format_time(secs: f64) -> String {
     let s = secs.max(0.0) as i64;
@@ -460,6 +473,7 @@ impl ImageViewerApp {
                 start_time.elapsed()
             );
             self.display_loaded_image(preview, renderer);
+            self.sync_fit_zoom(renderer);
             self.start_full_res_load(path, renderer);
         } else if let Some(thumb) = load_embedded_thumbnail(&path) {
             log::info!(
@@ -468,6 +482,7 @@ impl ImageViewerApp {
                 start_time.elapsed()
             );
             self.display_loaded_image(to_pixel_buf(thumb), renderer);
+            self.sync_fit_zoom(renderer);
             self.start_full_res_load(path, renderer);
         } else {
             // No preview available; route the decode through the worker and show a
@@ -504,6 +519,27 @@ impl ImageViewerApp {
             animation: None,
         });
         self.last_error = None;
+    }
+
+    /// Immediately compute and apply the fit-to-window zoom/offset for the
+    /// image that was *just* set via `display_loaded_image`/
+    /// `display_animated_image`, rather than waiting for the next `update()`
+    /// call to do it. Needed because a peek or wheel-zoom triggered in the
+    /// same event batch as a navigation (e.g. a fast tap right after
+    /// switching images, before `update()` runs) would otherwise read
+    /// `self.zoom`/`self.offset` while they still hold the *previous*
+    /// image's values.
+    fn sync_fit_zoom(&mut self, renderer: &Renderer) {
+        let Some(image) = &self.image else { return };
+        let full_res_size = Vec2::new(
+            image.full_res_image.width() as f32,
+            image.full_res_image.height() as f32,
+        );
+        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
+        let (zoom, offset) = fit_zoom_and_offset(full_res_size, area);
+        self.zoom = zoom;
+        self.offset = offset;
+        self.velocity = Vec2::ZERO;
     }
 
     fn display_animated_image(&mut self, frames: Vec<AnimationFrame>, renderer: &Renderer) {
@@ -1250,16 +1286,9 @@ impl ImageViewerApp {
                 Vec2::new(image.full_res_image.width() as f32, image.full_res_image.height() as f32);
 
             if self.is_scaled_to_fit {
-                let aspect_ratio = full_res_size.x / full_res_size.y;
-                let available_aspect = area.width() / area.height();
-                let mut fit_size = area.size();
-                if aspect_ratio > available_aspect {
-                    fit_size.y = fit_size.x / aspect_ratio;
-                } else {
-                    fit_size.x = fit_size.y * aspect_ratio;
-                }
-                self.zoom = fit_size.x / full_res_size.x;
-                self.offset = (area.size() - fit_size) * 0.5;
+                let (zoom, offset) = fit_zoom_and_offset(full_res_size, area);
+                self.zoom = zoom;
+                self.offset = offset;
                 self.velocity = Vec2::ZERO;
             } else {
                 if self.peeking.is_none() && !self.dragging {

@@ -650,23 +650,10 @@ impl ImageViewerApp {
                         }
                     };
                     let preview_width = reply.preview_width as f32;
-                    if preview_width > 0.0
-                        && new_width > 0.0
-                        && !self.is_scaled_to_fit
-                        && self.peeking.is_none()
-                    {
-                        // Preserve the user's current view across the preview→full swap.
-                        // Pure continuity-preserving rescale, no floor clamp: clamping here
-                        // would move the zoom without moving the offset to match, visibly
-                        // shifting/misaligning the frame right as the swap lands. If that
-                        // leaves the zoom briefly under the floor, the next manual zoom
-                        // action settles it back above via the wheel handler's own clamp.
-                        // Skipped entirely while peeking, since a peek's zoom is pinned at
-                        // MIN_ZOOM for the whole gesture (see `update_peek_offset`) and this
-                        // rescale would knock it off that pin without `update_peek_offset`
-                        // knowing to correct for it.
-                        self.zoom *= preview_width / new_width;
-                    }
+
+                    // Swap the texture in *first*, so everything below operates on
+                    // `self.image`'s new (post-swap) dimensions rather than the
+                    // about-to-be-replaced preview's.
                     match loaded {
                         LoadedImage::Static(full_res) => {
                             self.display_loaded_image(full_res, renderer)
@@ -675,6 +662,42 @@ impl ImageViewerApp {
                             self.display_animated_image(frames, renderer)
                         }
                     }
+
+                    if preview_width > 0.0 && new_width > 0.0 && !self.is_scaled_to_fit {
+                        let was_peeking = self.peeking.is_some();
+                        if let Some(anchor) = &mut self.peeking {
+                            // While peeking, `anchor.fit_zoom`/`fit_offset` are a
+                            // reference frame tied to whatever texture was active
+                            // when the peek started — rescale `fit_zoom` the same
+                            // way the plain-zoom case below does, so the anchor
+                            // keeps mapping the cursor to the same position in the
+                            // image now that the swap has changed those dimensions
+                            // underfoot. (`fit_offset` doesn't need to change: a
+                            // uniform scale of both the texture and `fit_zoom` by
+                            // the same reciprocal factor cancels out, same as for
+                            // `self.zoom`/`self.offset` in the non-peek case.)
+                            anchor.fit_zoom *= preview_width / new_width;
+                        }
+                        if was_peeking {
+                            // Refresh immediately (don't wait for the next mouse
+                            // move) so the view doesn't visibly jump/misalign for
+                            // however long the hand happens to stay still. Safe to
+                            // recompute now: `self.image` above already reflects
+                            // the new (full-res) dimensions this needs.
+                            let cursor = self.mouse_pos;
+                            self.update_peek_offset(cursor, renderer);
+                        } else {
+                            // Preserve the user's current view across the preview→full
+                            // swap. Pure continuity-preserving rescale, no floor clamp:
+                            // clamping here would move the zoom without moving the
+                            // offset to match, visibly shifting/misaligning the frame
+                            // right as the swap lands. If that leaves the zoom briefly
+                            // under the floor, the next manual zoom action settles it
+                            // back above via the wheel handler's own clamp.
+                            self.zoom *= preview_width / new_width;
+                        }
+                    }
+
                     if reply.is_preview {
                         log::info!("Showed fast preview for: {}", reply.path.display());
                     } else {

@@ -664,27 +664,18 @@ impl ImageViewerApp {
                     }
 
                     if preview_width > 0.0 && new_width > 0.0 && !self.is_scaled_to_fit {
-                        // Preserve the current apparent size across the preview→full
-                        // swap — for both the peek and plain-zoom cases alike. Pure
-                        // continuity-preserving rescale, no floor clamp: clamping here
-                        // would move the zoom without moving the offset to match,
-                        // visibly shifting/misaligning the frame right as the swap
-                        // lands. If that leaves the zoom briefly under the floor, the
-                        // next manual zoom action settles it back above via the wheel
-                        // handler's own clamp; a peek in progress settles back to
-                        // MIN_ZOOM the moment it's released and re-fit to the window.
-                        self.zoom *= preview_width / new_width;
-
                         let was_peeking = self.peeking.is_some();
                         if let Some(anchor) = &mut self.peeking {
-                            // The peek anchor is a *separate* reference frame (maps
-                            // cursor position to a position in the image) that also
-                            // needs rescaling the same way, so it stays valid now
-                            // that the swap has changed the texture's dimensions.
-                            // (`fit_offset` doesn't need to change: a uniform scale of
-                            // both the texture and `fit_zoom` by the same reciprocal
-                            // factor cancels out, same as for `self.zoom`/`self.offset`
-                            // just above.)
+                            // While peeking, `anchor.fit_zoom`/`fit_offset` are a
+                            // reference frame tied to whatever texture was active
+                            // when the peek started — rescale `fit_zoom` the same
+                            // way the plain-zoom case below does, so the anchor
+                            // keeps mapping the cursor to the same position in the
+                            // image now that the swap has changed those dimensions
+                            // underfoot. (`fit_offset` doesn't need to change: a
+                            // uniform scale of both the texture and `fit_zoom` by
+                            // the same reciprocal factor cancels out, same as for
+                            // `self.zoom`/`self.offset` in the non-peek case.)
                             anchor.fit_zoom *= preview_width / new_width;
                         }
                         if was_peeking {
@@ -692,10 +683,18 @@ impl ImageViewerApp {
                             // move) so the view doesn't visibly jump/misalign for
                             // however long the hand happens to stay still. Safe to
                             // recompute now: `self.image` above already reflects
-                            // the new (full-res) dimensions this needs, and
-                            // `update_peek_offset` reads the just-rescaled `self.zoom`.
+                            // the new (full-res) dimensions this needs.
                             let cursor = self.mouse_pos;
                             self.update_peek_offset(cursor, renderer);
+                        } else {
+                            // Preserve the user's current view across the preview→full
+                            // swap. Pure continuity-preserving rescale, no floor clamp:
+                            // clamping here would move the zoom without moving the
+                            // offset to match, visibly shifting/misaligning the frame
+                            // right as the swap lands. If that leaves the zoom briefly
+                            // under the floor, the next manual zoom action settles it
+                            // back above via the wheel handler's own clamp.
+                            self.zoom *= preview_width / new_width;
                         }
                     }
 
@@ -967,25 +966,21 @@ impl ImageViewerApp {
     /// in the image using the fit-to-window transform captured when the peek
     /// started (`self.peeking`) — a *fixed* reference, so the cursor keeps
     /// mapping to the same position in the image for the whole gesture no
-    /// matter how far the peek's own offset has since panned. That's what
-    /// lets one continuous hold reach every part of the image — portrait or
-    /// landscape — since a fixed relative-delta pan could run out of screen
-    /// to move the mouse across before covering a tall or wide image. Uses
-    /// `self.zoom` (not a hardcoded 1.0): it starts at `MIN_ZOOM` when the
-    /// peek begins, but a preview→full-res swap mid-peek rescales it to keep
-    /// the apparent size on screen continuous (see `check_pending_load`), and
-    /// this has to stay in step with whatever that rescale leaves it at. The
-    /// result is clamped so the image always covers the viewport (never shows
-    /// blank space past its own edges).
+    /// matter how far the peek's own (1:1) offset has since panned. That's
+    /// what lets one continuous hold reach every part of the image — portrait
+    /// or landscape — since a fixed relative-delta pan could run out of
+    /// screen to move the mouse across before covering a tall or wide image.
+    /// The result is clamped so the image always covers the viewport (never
+    /// shows blank space past its own edges).
     fn update_peek_offset(&mut self, cursor: Vec2, renderer: &Renderer) {
         let Some(anchor) = self.peeking else { return };
         let Some(image) = &self.image else { return };
         let image_point = (cursor - anchor.fit_offset) / anchor.fit_zoom;
-        let raw_offset = cursor - image_point * self.zoom;
+        let raw_offset = cursor - image_point * MIN_ZOOM;
         let img_size = Vec2::new(
             image.full_res_image.width() as f32,
             image.full_res_image.height() as f32,
-        ) * self.zoom;
+        ) * MIN_ZOOM;
         let view = renderer.drawable_size();
         self.offset = clamp_offset_to_bounds(raw_offset, view, img_size);
     }

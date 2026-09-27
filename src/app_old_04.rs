@@ -361,14 +361,6 @@ pub struct ImageViewerApp {
     /// `dragging` for the left button's behavior once the image is already
     /// manually zoomed.
     peeking: Option<PeekAnchor>,
-    /// Click position remembered when the left button is pressed to peek but
-    /// the full-res decode for this image hasn't landed yet — starting the
-    /// peek right away would anchor it against the preview's (lower)
-    /// resolution, which then noticeably resizes once full-res replaces it.
-    /// Instead, `check_pending_load` starts the peek from here once the real
-    /// thing lands (if `is_scaled_to_fit` still holds); released before that
-    /// happens, it's just dropped. See `start_peek`.
-    pending_peek: Option<Vec2>,
     /// True while the left button drags a manually-zoomed image (hand-tool
     /// style pan, content follows the cursor with a bit of fling momentum).
     /// Only entered when `is_scaled_to_fit` is already false; at the default
@@ -417,7 +409,6 @@ impl ImageViewerApp {
             confirm_delete,
             mouse_pos: Vec2::ZERO,
             peeking: None,
-            pending_peek: None,
             dragging: false,
             interacted: false,
             context_menu: None,
@@ -451,7 +442,6 @@ impl ImageViewerApp {
         self.is_scaled_to_fit = true;
         self.velocity = Vec2::ZERO;
         self.peeking = None;
-        self.pending_peek = None;
         self.dragging = false;
         self.full_res_pending = false;
         self.full_res_pending_since = None;
@@ -706,21 +696,6 @@ impl ImageViewerApp {
                             // `update_peek_offset` reads the just-rescaled `self.zoom`.
                             let cursor = self.mouse_pos;
                             self.update_peek_offset(cursor, renderer);
-                        }
-                    }
-
-                    if !reply.is_preview {
-                        if let Some(p) = self.pending_peek.take() {
-                            // The click that deferred is still (presumably) held —
-                            // start the peek now, anchored against the real
-                            // full-res data instead of the preview that was
-                            // showing when it was pressed. `is_scaled_to_fit` can
-                            // only have changed since if something else (a wheel
-                            // zoom, Enter) moved the view on; in that case this
-                            // click is stale, so just drop it.
-                            if self.is_scaled_to_fit {
-                                self.start_peek(p, renderer);
-                            }
                         }
                     }
 
@@ -1015,31 +990,6 @@ impl ImageViewerApp {
         self.offset = clamp_offset_to_bounds(raw_offset, view, img_size);
     }
 
-    /// Start a 1:1 peek anchored at `p`. Computes the fit-to-window reference
-    /// fresh from whatever `self.image` currently holds (rather than trusting
-    /// `self.zoom`/`self.offset`, which may not have been refreshed for it
-    /// yet), so the anchor is always correct for *this* image's dimensions —
-    /// which only matters if this is called for a fresh navigation's
-    /// synchronously-available preview; called from `check_pending_load`,
-    /// `self.image` is already the just-landed full-res data. Only call this
-    /// once the image showing is the one you want to peek — that's
-    /// `full_res_pending` finally false, or `pending_peek` if it wasn't.
-    fn start_peek(&mut self, p: Vec2, renderer: &Renderer) {
-        let Some(image) = &self.image else { return };
-        let full_res_size = Vec2::new(
-            image.full_res_image.width() as f32,
-            image.full_res_image.height() as f32,
-        );
-        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-        let (fit_zoom, fit_offset) = fit_zoom_and_offset(full_res_size, area);
-        self.peeking = Some(PeekAnchor { fit_zoom, fit_offset });
-        self.zoom = MIN_ZOOM;
-        self.update_peek_offset(p, renderer);
-        self.is_scaled_to_fit = false;
-        self.velocity = Vec2::ZERO;
-        self.interacted = true;
-    }
-
     // --- Event handling ------------------------------------------------------
 
     pub fn handle_event(&mut self, event: &Event, renderer: &mut Renderer) {
@@ -1079,15 +1029,16 @@ impl ImageViewerApp {
                     // Grabbed the seek-bar marker; scrubbing handled on motion/up.
                 } else if self.image.is_some() {
                     if self.is_scaled_to_fit {
-                        if self.full_res_pending {
-                            // Only a preview is showing so far; starting the peek
-                            // against it now would anchor at a resolution about to
-                            // be replaced, visibly resizing the moment full-res
-                            // lands. Defer — check_pending_load starts it instead.
-                            self.pending_peek = Some(p);
-                        } else {
-                            self.start_peek(p, renderer);
-                        }
+                        // At the default fit view: hold to peek at 1:1. Capture the
+                        // current fit transform as a fixed reference for the whole
+                        // gesture (see `update_peek_offset`), then jump to native
+                        // size anchored on the click point.
+                        self.peeking = Some(PeekAnchor { fit_zoom: self.zoom, fit_offset: self.offset });
+                        self.zoom = MIN_ZOOM;
+                        self.update_peek_offset(p, renderer);
+                        self.is_scaled_to_fit = false;
+                        self.velocity = Vec2::ZERO;
+                        self.interacted = true;
                     } else {
                         // Already zoomed in by hand: plain click-and-drag pans,
                         // hand-tool style, instead of peeking.
@@ -1117,8 +1068,6 @@ impl ImageViewerApp {
                 }
             }
             Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
-                // Cancel a deferred peek that never got to start.
-                self.pending_peek = None;
                 if self.scrubbing {
                     // Commit the seek to the marker's final position.
                     self.scrubbing = false;

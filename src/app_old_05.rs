@@ -47,20 +47,6 @@ const FULL_RES_WATCHDOG: Duration = Duration::from_secs(20);
 /// this floor — it can still shrink (or grow) an image past either bound to
 /// fit the window exactly.
 const MIN_ZOOM: f32 = 1.0;
-/// Two left-button presses count as a double-click (which exits the app) when
-/// the second lands within this long of the first...
-const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(400);
-/// ...and within this many pixels of it.
-const DOUBLE_CLICK_MAX_DISTANCE: f32 = 10.0;
-/// Side length of the close ('X') button hugging the top-right corner. It's
-/// only drawn while the pointer is over it, so this is also the hover zone.
-const CLOSE_BUTTON_SIZE: f32 = 44.0;
-/// Font size of the info line drawn in the top-left corner.
-const INFO_TEXT_PX: f32 = 16.0;
-/// File names at least this many characters long (extension excluded) that
-/// contain 2+ hyphens get their middle elided by `shorten_file_name`. Chosen so
-/// `a-very-long-name.jpg` (a 16-character stem) is shortened to `a...name.jpg`.
-const FILE_NAME_SHORTEN_MIN_CHARS: usize = 16;
 
 /// Fit `content` (in pixels) into `area`, preserving aspect ratio and centering.
 /// Used to letterbox/pillarbox video frames in the central panel.
@@ -102,81 +88,6 @@ fn fit_zoom_and_offset(content: Vec2, area: Rect) -> (f32, Vec2) {
     let zoom = if content.x > 0.0 { fitted.width() / content.x } else { MIN_ZOOM };
     let offset = fitted.min - area.min;
     (zoom, offset)
-}
-
-/// Human-readable file size for the info line: `812 B`, `48.3 KB`, `4.82 MB`,
-/// `1.20 GB` (1024-based).
-fn format_file_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    let b = bytes as f64;
-    if b < KB {
-        format!("{bytes} B")
-    } else if b < MB {
-        format!("{:.1} KB", b / KB)
-    } else if b < GB {
-        format!("{:.2} MB", b / MB)
-    } else {
-        format!("{:.2} GB", b / GB)
-    }
-}
-
-/// Shorten a long kebab-case file name for the info line: keep the word before
-/// the first `-` and the word after the last `-`, replace everything between
-/// with `...`, and always keep the extension — `a-very-long-name.jpg` becomes
-/// `a...name.jpg`. Names that are short (see `FILE_NAME_SHORTEN_MIN_CHARS`), or
-/// that don't have at least two hyphens (so there's no middle to elide), are
-/// returned unchanged.
-fn shorten_file_name(name: &str) -> String {
-    let path = Path::new(name);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    let ext = path.extension().and_then(|e| e.to_str());
-    if stem.chars().count() < FILE_NAME_SHORTEN_MIN_CHARS {
-        return name.to_string();
-    }
-    let (Some(first), Some(last)) = (stem.find('-'), stem.rfind('-')) else {
-        return name.to_string();
-    };
-    if first == last {
-        return name.to_string();
-    }
-    // `-` is one byte, so slicing right at / after it always lands on a char boundary.
-    let shortened = format!("{}...{}", &stem[..first], &stem[last + 1..]);
-    match ext {
-        Some(ext) => format!("{shortened}.{ext}"),
-        None => shortened,
-    }
-}
-
-/// Hit area (and drawn area) of the close ('X') button: a square flush against
-/// the top-right corner of `area`, so flinging the pointer into the corner is
-/// enough to reach it.
-fn close_button_rect(area: Rect) -> Rect {
-    Rect::xywh(
-        area.max().x - CLOSE_BUTTON_SIZE,
-        area.min.y,
-        CLOSE_BUTTON_SIZE,
-        CLOSE_BUTTON_SIZE,
-    )
-}
-
-/// Draw the close button — a red square with a white 'X'. Callers only invoke
-/// this while the pointer is over `close_button_rect(area)`.
-fn draw_close_button(r: &mut Renderer, area: Rect) {
-    let rect = close_button_rect(area);
-    r.fill_rect(rect, rgba8(196, 43, 28, 230));
-    let px = 20.0;
-    let glyph_h = r.text_size("X", px).y;
-    let pos = Vec2::new(rect.center().x, rect.center().y - glyph_h / 2.0);
-    r.draw_text("X", px, pos, TextAlign::Center, WHITE);
-}
-
-/// Draw `text` in the top-left corner of `area` as floating text: no backing
-/// panel, just a thin dark outline so it stays legible over any image.
-fn draw_info_line(r: &mut Renderer, area: Rect, text: &str) {
-    let pos = area.min + Vec2::new(12.0, 10.0);
-    r.draw_text_outlined(text, INFO_TEXT_PX, pos, TextAlign::Left, rgba8(235, 235, 235, 255));
 }
 
 /// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
@@ -431,10 +342,6 @@ pub struct ImageViewerApp {
     is_randomized: bool,
     show_delete_confirmation: bool,
     last_error: Option<String>,
-    /// On-disk size of the currently shown file, cached at load time for the
-    /// info line (`build_info_line`) rather than re-reading it every frame.
-    /// `None` if the size couldn't be read.
-    current_file_size: Option<u64>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
@@ -448,9 +355,6 @@ pub struct ImageViewerApp {
 
     // --- input state (event-driven) ---
     mouse_pos: Vec2,
-    /// Time and position of the last left-button press, to recognize the next
-    /// one as a double-click (see `DOUBLE_CLICK_MAX_INTERVAL`/`_DISTANCE`).
-    last_left_click: Option<(Instant, Vec2)>,
     /// `Some` while the left button is held to peek at 1:1 — only entered from
     /// the default fit-to-window view. Holds the fit transform captured at the
     /// start of the gesture (see `PeekAnchor`/`update_peek_offset`). See
@@ -503,7 +407,6 @@ impl ImageViewerApp {
             is_randomized: false,
             show_delete_confirmation: false,
             last_error: None,
-            current_file_size: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
@@ -513,7 +416,6 @@ impl ImageViewerApp {
             keybindings,
             confirm_delete,
             mouse_pos: Vec2::ZERO,
-            last_left_click: None,
             peeking: None,
             pending_peek: None,
             dragging: false,
@@ -545,7 +447,6 @@ impl ImageViewerApp {
         let path = self.image_files[self.image_order[self.current_index]].clone();
         log::info!("Loading image: {}", path.display());
         let start_time = Instant::now();
-        self.current_file_size = fs::metadata(&path).ok().map(|m| m.len());
 
         self.is_scaled_to_fit = true;
         self.velocity = Vec2::ZERO;
@@ -1151,31 +1052,7 @@ impl ImageViewerApp {
                 let p = Vec2::new(*x, *y);
                 self.mouse_pos = p;
                 let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-
-                let now = Instant::now();
-                let is_double_click = self
-                    .last_left_click
-                    .map(|(t, prev_p)| {
-                        now.duration_since(t) < DOUBLE_CLICK_MAX_INTERVAL
-                            && (p - prev_p).length_sq()
-                                < DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE
-                    })
-                    .unwrap_or(false);
-                self.last_left_click = Some((now, p));
-
-                if close_button_rect(area).contains(p) {
-                    // Always wins, regardless of any dialog/menu state — a
-                    // window's close button isn't supposed to need those closed
-                    // first.
-                    self.should_quit = true;
-                } else if is_double_click
-                    && !self.show_delete_confirmation
-                    && self.context_menu.is_none()
-                {
-                    // Skipped while a dialog/menu is up so a fast double-tap
-                    // aimed at dismissing one doesn't also quit the app.
-                    self.should_quit = true;
-                } else if self.show_delete_confirmation {
+                if self.show_delete_confirmation {
                     // Hit-test the dialog buttons; clicks elsewhere keep it open.
                     let (_, cancel, delete) = delete_dialog_layout(area);
                     if delete.contains(p) {
@@ -1546,32 +1423,6 @@ impl ImageViewerApp {
 
     // --- Render --------------------------------------------------------------
 
-    /// Build the "name - WxH - size - N/total" info line for whatever's
-    /// currently shown (image or video), or `None` if there's nothing valid
-    /// to report (e.g. an error is displayed instead).
-    fn build_info_line(&self) -> Option<String> {
-        let (w, h) = if let Some(image) = &self.image {
-            (image.full_res_image.width(), image.full_res_image.height())
-        } else if let Some(video) = &self.video {
-            (video.frame_size[0], video.frame_size[1])
-        } else {
-            return None;
-        };
-        let file_idx = *self.image_order.get(self.current_index)?;
-        let path = self.image_files.get(file_idx)?;
-        let file_name = path.file_name()?.to_string_lossy().into_owned();
-        let file_name = shorten_file_name(&file_name);
-        let size_str = self
-            .current_file_size
-            .map(format_file_size)
-            .unwrap_or_else(|| "N/A".to_string());
-        Some(format!(
-            "{file_name} - {w}x{h} - {size_str} - {}/{}",
-            self.current_index + 1,
-            self.image_files.len()
-        ))
-    }
-
     pub fn render(&mut self, renderer: &mut Renderer) -> anyhow::Result<()> {
         // Apply fullscreen toggles requested via key/menu.
         if renderer.is_fullscreen() != self.is_fullscreen {
@@ -1647,13 +1498,6 @@ impl ImageViewerApp {
         }
         if self.context_menu.is_some() {
             self.render_context_menu(renderer, area);
-        }
-
-        if let Some(line) = self.build_info_line() {
-            draw_info_line(renderer, area, &line);
-        }
-        if close_button_rect(area).contains(self.mouse_pos) {
-            draw_close_button(renderer, area);
         }
 
         renderer.end_frame()

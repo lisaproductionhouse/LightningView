@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, mpsc::Receiver, Arc},
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -52,12 +52,9 @@ const MIN_ZOOM: f32 = 1.0;
 const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(400);
 /// ...and within this many pixels of it.
 const DOUBLE_CLICK_MAX_DISTANCE: f32 = 10.0;
-/// Size of the close ('X') button hugging the top-right corner — a flat, wide
-/// rectangle (modern Windows titlebar-button proportions) rather than a
-/// square. It's only drawn while the pointer is over it, so this is also the
-/// hover zone.
-const CLOSE_BUTTON_WIDTH: f32 = 56.0;
-const CLOSE_BUTTON_HEIGHT: f32 = 34.0;
+/// Side length of the close ('X') button hugging the top-right corner. It's
+/// only drawn while the pointer is over it, so this is also the hover zone.
+const CLOSE_BUTTON_SIZE: f32 = 44.0;
 /// Font size of the info line drawn in the top-left corner.
 const INFO_TEXT_PX: f32 = 16.0;
 /// File names at least this many characters long (extension excluded) that
@@ -107,27 +104,22 @@ fn fit_zoom_and_offset(content: Vec2, area: Rect) -> (f32, Vec2) {
     (zoom, offset)
 }
 
-/// File size for the info line, always in KB (whole number, 1024-based,
-/// comma-grouped) rather than switching units at MB/GB — e.g. `4,853 KB` —
-/// so small size differences between similar-looking photos (useful for
-/// spotting a soft/missed-focus shot) stay easy to compare at a glance.
+/// Human-readable file size for the info line: `812 B`, `48.3 KB`, `4.82 MB`,
+/// `1.20 GB` (1024-based).
 fn format_file_size(bytes: u64) -> String {
-    let kb = (bytes as f64 / 1024.0).round() as u64;
-    format!("{} KB", format_with_commas(kb))
-}
-
-/// Format a non-negative integer with comma thousands separators:
-/// `4853` -> `4,853`, `1234567` -> `1,234,567`.
-fn format_with_commas(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.2} MB", b / MB)
+    } else {
+        format!("{:.2} GB", b / GB)
     }
-    out
 }
 
 /// Shorten a long kebab-case file name for the info line: keep the word before
@@ -157,24 +149,24 @@ fn shorten_file_name(name: &str) -> String {
     }
 }
 
-/// Hit area (and drawn area) of the close ('X') button: a flat rectangle
-/// flush against the top-right corner of `area`, so flinging the pointer into
-/// the corner is enough to reach it.
+/// Hit area (and drawn area) of the close ('X') button: a square flush against
+/// the top-right corner of `area`, so flinging the pointer into the corner is
+/// enough to reach it.
 fn close_button_rect(area: Rect) -> Rect {
     Rect::xywh(
-        area.max().x - CLOSE_BUTTON_WIDTH,
+        area.max().x - CLOSE_BUTTON_SIZE,
         area.min.y,
-        CLOSE_BUTTON_WIDTH,
-        CLOSE_BUTTON_HEIGHT,
+        CLOSE_BUTTON_SIZE,
+        CLOSE_BUTTON_SIZE,
     )
 }
 
-/// Draw the close button — a red rectangle with a white 'X'. Callers only
-/// invoke this while the pointer is over `close_button_rect(area)`.
+/// Draw the close button — a red square with a white 'X'. Callers only invoke
+/// this while the pointer is over `close_button_rect(area)`.
 fn draw_close_button(r: &mut Renderer, area: Rect) {
     let rect = close_button_rect(area);
     r.fill_rect(rect, rgba8(196, 43, 28, 230));
-    let px = 18.0;
+    let px = 20.0;
     let glyph_h = r.text_size("X", px).y;
     let pos = Vec2::new(rect.center().x, rect.center().y - glyph_h / 2.0);
     r.draw_text("X", px, pos, TextAlign::Center, WHITE);
@@ -443,23 +435,12 @@ pub struct ImageViewerApp {
     /// info line (`build_info_line`) rather than re-reading it every frame.
     /// `None` if the size couldn't be read.
     current_file_size: Option<u64>,
-    /// True (full) resolution of the currently shown image, for the info
-    /// line. Deliberately *not* the preview/thumbnail's size: it's set only
-    /// once the real full-res decode lands (`check_pending_load`), reset to
-    /// `None` on every navigation, and never set from a preview, so the info
-    /// line shows nothing (rather than a number that would immediately jump)
-    /// until the true size is known.
-    current_full_res_size: Option<(usize, usize)>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
     full_res_worker: Option<FullResWorker>,
     preload_state: Option<Arc<PreloadState>>,
     memory_gate: Arc<MemoryGate>,
-    /// Paths handed off from newly-launched instances (see `main.rs`'s
-    /// single-instance listener and `set_instance_receiver`). Polled in
-    /// `update()`; `None` until `set_instance_receiver` is called.
-    instance_rx: Option<Receiver<PathBuf>>,
     /// Configurable key bindings for video seeking and file browsing.
     keybindings: KeyBindings,
     /// Whether to show a confirmation dialog before deleting (see `config.rs`).
@@ -523,14 +504,12 @@ impl ImageViewerApp {
             show_delete_confirmation: false,
             last_error: None,
             current_file_size: None,
-            current_full_res_size: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
             full_res_worker,
             preload_state: None,
             memory_gate,
-            instance_rx: None,
             keybindings,
             confirm_delete,
             mouse_pos: Vec2::ZERO,
@@ -544,35 +523,21 @@ impl ImageViewerApp {
             scrub_frac: 0.0,
             should_quit: false,
         };
-        match path {
-            Some(path) => app.open_new_file(path, renderer),
-            None => app.last_error = Some("No image file specified.".to_string()),
+        if let Some(path) = path {
+            app.gather_images_from_directory(&path);
+            if !app.image_files.is_empty() {
+                app.load_image_at_index(app.current_index, renderer);
+                app.start_bulk_preload();
+            } else {
+                app.last_error = Some(format!(
+                    "No supported images found in directory of '{}'",
+                    path.display()
+                ));
+            }
+        } else {
+            app.last_error = Some("No image file specified.".to_string());
         }
         app
-    }
-
-    /// Hand the single-instance receiver to this app (see `main.rs`); polled
-    /// in `update()` for paths handed off by newly-launched instances.
-    pub fn set_instance_receiver(&mut self, rx: Receiver<PathBuf>) {
-        self.instance_rx = Some(rx);
-    }
-
-    /// Switch to viewing an entirely different file, possibly in a different
-    /// directory — rebuilding the browse list from `path`'s directory, same
-    /// as opening it fresh. Used both for the file given on the command line
-    /// and for one handed off by a newly-launched instance (see `main.rs`'s
-    /// single-instance listener and `update`'s use of `instance_rx`).
-    fn open_new_file(&mut self, path: PathBuf, renderer: &Renderer) {
-        self.gather_images_from_directory(&path);
-        if !self.image_files.is_empty() {
-            self.load_image_at_index(self.current_index, renderer);
-            self.start_bulk_preload();
-        } else {
-            self.last_error = Some(format!(
-                "No supported images found in directory of '{}'",
-                path.display()
-            ));
-        }
     }
 
     fn load_image_at_index(&mut self, index: usize, renderer: &Renderer) {
@@ -581,7 +546,6 @@ impl ImageViewerApp {
         log::info!("Loading image: {}", path.display());
         let start_time = Instant::now();
         self.current_file_size = fs::metadata(&path).ok().map(|m| m.len());
-        self.current_full_res_size = None;
 
         self.is_scaled_to_fit = true;
         self.velocity = Vec2::ZERO;
@@ -788,14 +752,10 @@ impl ImageViewerApp {
             }
             match reply.result {
                 Ok(loaded) => {
-                    let (new_width, new_height) = match &loaded {
-                        LoadedImage::Static(img) => (img.width() as f32, img.height() as f32),
+                    let new_width = match &loaded {
+                        LoadedImage::Static(img) => img.width() as f32,
                         LoadedImage::Animated(frames) => {
-                            let first = frames.first();
-                            (
-                                first.map(|f| f.image.width()).unwrap_or(0) as f32,
-                                first.map(|f| f.image.height()).unwrap_or(0) as f32,
-                            )
+                            frames.first().map(|f| f.image.width()).unwrap_or(0) as f32
                         }
                     };
                     let preview_width = reply.preview_width as f32;
@@ -849,7 +809,6 @@ impl ImageViewerApp {
                     }
 
                     if !reply.is_preview {
-                        self.current_full_res_size = Some((new_width as usize, new_height as usize));
                         if let Some(p) = self.pending_peek.take() {
                             // The click that deferred is still (presumably) held —
                             // start the peek now, anchored against the real
@@ -1480,16 +1439,6 @@ impl ImageViewerApp {
     // --- Per-frame update ----------------------------------------------------
 
     pub fn update(&mut self, renderer: &mut Renderer) {
-        // A newly-launched instance handed us a file instead of opening its
-        // own window (see `main.rs`): switch to it and surface the window so
-        // the user actually sees that happen.
-        let incoming_path = self.instance_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(path) = incoming_path {
-            self.open_new_file(path, renderer);
-            renderer.window().restore();
-            renderer.window().raise();
-        }
-
         self.check_pending_load(renderer);
 
         // Engage HDR passthrough when HDR video plays on an HDR-capable display,
@@ -1601,18 +1550,10 @@ impl ImageViewerApp {
     /// currently shown (image or video), or `None` if there's nothing valid
     /// to report (e.g. an error is displayed instead).
     fn build_info_line(&self) -> Option<String> {
-        // Resolution is always the *true* full-res size, never the preview's:
-        // a preview typically lands within milliseconds, so showing its size
-        // first would just mean the number immediately jumps to the real one
-        // a moment later. Shows "..." for the brief window before it's known
-        // (see `current_full_res_size`) rather than a value that would move.
-        let res_str = if self.image.is_some() {
-            match self.current_full_res_size {
-                Some((w, h)) => format!("{w}x{h}"),
-                None => "...".to_string(),
-            }
+        let (w, h) = if let Some(image) = &self.image {
+            (image.full_res_image.width(), image.full_res_image.height())
         } else if let Some(video) = &self.video {
-            format!("{}x{}", video.frame_size[0], video.frame_size[1])
+            (video.frame_size[0], video.frame_size[1])
         } else {
             return None;
         };
@@ -1625,7 +1566,7 @@ impl ImageViewerApp {
             .map(format_file_size)
             .unwrap_or_else(|| "N/A".to_string());
         Some(format!(
-            "{file_name} - {res_str} - {size_str} - {}/{}",
+            "{file_name} - {w}x{h} - {size_str} - {}/{}",
             self.current_index + 1,
             self.image_files.len()
         ))

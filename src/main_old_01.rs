@@ -1,15 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{
-    env,
-    error::Error,
-    io::{BufRead, BufReader, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
-    sync::mpsc::{channel, Receiver},
-    thread,
-    time::Duration,
-};
+use std::{env, error::Error, path::PathBuf, time::Duration};
 
 mod app;
 mod audio;
@@ -35,55 +26,6 @@ use crate::gpu::Renderer;
 mod windows;
 #[cfg(target_os = "windows")]
 use crate::windows::*;
-
-/// Loopback port used to detect a running instance and hand a newly-opened
-/// file off to it instead of opening a second window. An arbitrary,
-/// hopefully-uncommon port — if something else on the machine happens to be
-/// using it, the worst case is falling back to opening a normal new window
-/// (see `try_handoff_to_running_instance`), not a hang or crash.
-const SINGLE_INSTANCE_PORT: u16 = 47891;
-
-/// Try to hand `path` off to an already-running instance. Returns `true` only
-/// once the file has actually been written to it, so the caller can be
-/// reasonably confident it'll be picked up — any failure along the way
-/// (nothing listening, connection refused, timed out) is treated as "we must
-/// be the only instance" and falls through to opening a window normally,
-/// rather than risking the user's file silently going nowhere.
-fn try_handoff_to_running_instance(path: &Path) -> bool {
-    let Ok(addr) = format!("127.0.0.1:{SINGLE_INSTANCE_PORT}").parse::<SocketAddr>() else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
-        return false;
-    };
-    writeln!(stream, "{}", path.display()).is_ok()
-}
-
-/// Bind the single-instance listener and, if that succeeds (we're the first
-/// instance), spawn its accept loop on a background thread. Each accepted
-/// connection is expected to write one line: the path of a file a later
-/// launch was asked to open, which gets forwarded to the app's main loop over
-/// the returned channel. If binding fails (another instance already owns the
-/// port — or, rarely, some unrelated bind failure), the returned receiver
-/// simply never yields anything; polling it is always safe either way.
-fn spawn_single_instance_listener() -> Receiver<PathBuf> {
-    let (tx, rx) = channel();
-    if let Ok(listener) = TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                let mut line = String::new();
-                if BufReader::new(stream).read_line(&mut line).is_ok() {
-                    let path = PathBuf::from(line.trim());
-                    if !path.as_os_str().is_empty() {
-                        let _ = tx.send(path);
-                    }
-                }
-            }
-        });
-    }
-    rx
-}
 
 // --- Main Entry Point ---
 fn main() {
@@ -202,14 +144,6 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let initial_path: PathBuf = get_absolute_path(image_file_arg)?;
 
-    // Single-instance: if another copy is already running, hand this file off
-    // to it — so it replaces whatever it's currently showing — instead of
-    // opening a second window.
-    if try_handoff_to_running_instance(&initial_path) {
-        return Ok(());
-    }
-    let instance_rx = spawn_single_instance_listener();
-
     // Set the Wayland/X11 application id (window class) before video init.
     sdl3::hint::set("SDL_APP_ID", "lightningview");
 
@@ -218,7 +152,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut renderer = Renderer::new(&video, "Lightning View", 1280, 720, is_fullscreen)?;
 
     let mut app = ImageViewerApp::new(Some(initial_path), is_fullscreen, &renderer);
-    app.set_instance_receiver(instance_rx);
 
     let mut event_pump = sdl.event_pump()?;
     'running: loop {

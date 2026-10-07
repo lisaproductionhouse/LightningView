@@ -380,17 +380,6 @@ impl Renderer {
         &self.window
     }
 
-    /// Un-minimize (if needed) and bring the window to the front with input
-    /// focus. `Window::restore`/`raise` need `&mut self`, which the `&self`
-    /// getter above can't give out, so this goes through `self.window`
-    /// (a private field) directly instead. Used when a newly-launched
-    /// instance hands a file off to this one rather than opening its own
-    /// window — see `ImageViewerApp::update`'s use of `instance_rx`.
-    pub fn raise_window(&mut self) {
-        self.window.restore();
-        self.window.raise();
-    }
-
     /// Drawable size in pixels (accounts for HiDPI scaling).
     pub fn drawable_size(&self) -> Vec2 {
         let (w, h) = self.window.size_in_pixels();

@@ -1486,7 +1486,8 @@ impl ImageViewerApp {
         let incoming_path = self.instance_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(path) = incoming_path {
             self.open_new_file(path, renderer);
-            renderer.raise_window();
+            renderer.window().restore();
+            renderer.window().raise();
         }
 
         self.check_pending_load(renderer);

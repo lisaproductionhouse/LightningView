@@ -391,6 +391,39 @@ impl Renderer {
         self.window.raise();
     }
 
+    /// Move the window flush with the top-left corner of display index
+    /// `display_index` (0-based, in the same order `log_displays` walks —
+    /// i.e. whatever `SDL_GetDisplays` reports). A no-op if that many
+    /// displays aren't connected or SDL can't report one's bounds; doesn't
+    /// touch fullscreen state (see `ImageViewerApp::send_to_display`, which
+    /// drops to windowed around this call so the move actually takes).
+    pub fn move_to_display(&mut self, display_index: usize) {
+        unsafe {
+            let mut count: i32 = 0;
+            let ids = sdl3::sys::video::SDL_GetDisplays(&mut count);
+            if ids.is_null() {
+                return;
+            }
+            let id = if display_index < count as usize {
+                Some(*ids.offset(display_index as isize))
+            } else {
+                None
+            };
+            sdl3::sys::stdinc::SDL_free(ids as *mut std::ffi::c_void);
+            let Some(id) = id else { return };
+
+            // Output param for SDL_GetDisplayBounds; zeroed (not just
+            // uninit) so a failed call leaves (0,0,0,0) rather than garbage.
+            // The exact type is inferred below from SDL_GetDisplayBounds's
+            // own signature, so it doesn't need naming here.
+            let mut bounds = std::mem::MaybeUninit::zeroed();
+            let _ = sdl3::sys::video::SDL_GetDisplayBounds(id, bounds.as_mut_ptr());
+            let bounds = bounds.assume_init();
+
+            let _ = sdl3::sys::video::SDL_SetWindowPosition(self.window.raw(), bounds.x, bounds.y);
+        }
+    }
+
     /// Drawable size in pixels (accounts for HiDPI scaling).
     pub fn drawable_size(&self) -> Vec2 {
         let (w, h) = self.window.size_in_pixels();

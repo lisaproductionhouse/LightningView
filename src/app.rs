@@ -1172,6 +1172,14 @@ impl ImageViewerApp {
         );
         let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
         let (fit_zoom, fit_offset) = fit_zoom_and_offset(full_res_size, area);
+        if fit_zoom >= MIN_ZOOM {
+            // The image is already at or below its native size at the
+            // default fit view (a small image on a big window/screen gets
+            // upscaled to fill it) — 1:1 would be smaller than, or the same
+            // as, what's already on screen, not a "zoom in". Leave the click
+            // a no-op instead of visibly shrinking the image.
+            return;
+        }
         self.peeking = Some(PeekAnchor { fit_zoom, fit_offset });
         self.zoom = MIN_ZOOM;
         self.update_peek_offset(p, renderer);
@@ -1360,13 +1368,35 @@ impl ImageViewerApp {
         }
     }
 
-    fn on_key(&mut self, kc: Keycode, keymod: Mod, renderer: &Renderer) {
+    fn on_key(&mut self, kc: Keycode, keymod: Mod, renderer: &mut Renderer) {
         let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
 
         // Clipboard copy (Ctrl+C).
         if ctrl && kc == Keycode::C {
             self.copy_to_clipboard();
             return;
+        }
+
+        // Send to monitor N (Ctrl+Win+Alt+1/2/3). Works regardless of any
+        // dialog/menu state, same reasoning as the close button. NOTE: on
+        // Windows, Win+<number> is frequently claimed system-wide for
+        // taskbar app-switching before any application (including this one)
+        // ever sees the key event — if this shortcut doesn't fire, that's
+        // almost certainly why, and there isn't anything app-side to do
+        // about it beyond picking different modifier keys.
+        let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+        let gui = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
+        if ctrl && alt && gui {
+            let display_index = match kc {
+                Keycode::Num1 | Keycode::Kp1 => Some(0),
+                Keycode::Num2 | Keycode::Kp2 => Some(1),
+                Keycode::Num3 | Keycode::Kp3 => Some(2),
+                _ => None,
+            };
+            if let Some(display_index) = display_index {
+                self.send_to_display(display_index, renderer);
+                return;
+            }
         }
 
         // Delete confirmation modal swallows most keys.
@@ -1455,6 +1485,24 @@ impl ImageViewerApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Move the window onto display `display_index` (0-based) — the
+    /// Ctrl+Win+Alt+<N> shortcut. A fullscreen window generally won't
+    /// reposition across displays on its own (the OS/compositor tends to
+    /// hold it to whichever display it's already fullscreened on), so if
+    /// we're fullscreen this drops to windowed just long enough to move,
+    /// then re-fullscreens — landing fullscreen on the new display instead
+    /// of just relocating a windowed one.
+    fn send_to_display(&mut self, display_index: usize, renderer: &mut Renderer) {
+        let was_fullscreen = self.is_fullscreen;
+        if was_fullscreen {
+            renderer.set_fullscreen(false);
+        }
+        renderer.move_to_display(display_index);
+        if was_fullscreen {
+            renderer.set_fullscreen(true);
         }
     }
 

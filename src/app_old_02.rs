@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, mpsc::Receiver, Arc},
     time::{Duration, Instant},
 };
 
@@ -47,6 +47,23 @@ const FULL_RES_WATCHDOG: Duration = Duration::from_secs(20);
 /// this floor — it can still shrink (or grow) an image past either bound to
 /// fit the window exactly.
 const MIN_ZOOM: f32 = 1.0;
+/// Two left-button presses count as a double-click (which exits the app) when
+/// the second lands within this long of the first...
+const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(400);
+/// ...and within this many pixels of it.
+const DOUBLE_CLICK_MAX_DISTANCE: f32 = 10.0;
+/// Size of the close ('X') button hugging the top-right corner — a flat, wide
+/// rectangle (modern Windows titlebar-button proportions) rather than a
+/// square. It's only drawn while the pointer is over it, so this is also the
+/// hover zone.
+const CLOSE_BUTTON_WIDTH: f32 = 56.0;
+const CLOSE_BUTTON_HEIGHT: f32 = 34.0;
+/// Font size of the info line drawn in the top-left corner.
+const INFO_TEXT_PX: f32 = 16.0;
+/// File names at least this many characters long (extension excluded) that
+/// contain 2+ hyphens get their middle elided by `shorten_file_name`. Chosen so
+/// `a-very-long-name.jpg` (a 16-character stem) is shortened to `a...name.jpg`.
+const FILE_NAME_SHORTEN_MIN_CHARS: usize = 16;
 
 /// Fit `content` (in pixels) into `area`, preserving aspect ratio and centering.
 /// Used to letterbox/pillarbox video frames in the central panel.
@@ -75,6 +92,99 @@ fn fit_zoom(content: Vec2, area: Rect) -> f32 {
         return MIN_ZOOM;
     }
     fit_centered(content, area).width() / content.x
+}
+
+/// The zoom *and* offset that exactly fit `content` within `area` — the same
+/// computation `is_scaled_to_fit` drives `zoom`/`offset` to every frame in
+/// `update()`. Shared so a freshly-displayed image can be put in this state
+/// immediately (see `ImageViewerApp::sync_fit_zoom`), rather than only from
+/// the next frame's `update()` — otherwise a peek or wheel-zoom triggered in
+/// the same event batch as a navigation reads the *previous* image's values.
+fn fit_zoom_and_offset(content: Vec2, area: Rect) -> (f32, Vec2) {
+    let fitted = fit_centered(content, area);
+    let zoom = if content.x > 0.0 { fitted.width() / content.x } else { MIN_ZOOM };
+    let offset = fitted.min - area.min;
+    (zoom, offset)
+}
+
+/// File size for the info line, always in KB (whole number, 1024-based,
+/// comma-grouped) rather than switching units at MB/GB — e.g. `4,853 KB` —
+/// so small size differences between similar-looking photos (useful for
+/// spotting a soft/missed-focus shot) stay easy to compare at a glance.
+fn format_file_size(bytes: u64) -> String {
+    let kb = (bytes as f64 / 1024.0).round() as u64;
+    format!("{} KB", format_with_commas(kb))
+}
+
+/// Format a non-negative integer with comma thousands separators:
+/// `4853` -> `4,853`, `1234567` -> `1,234,567`.
+fn format_with_commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Shorten a long kebab-case file name for the info line: keep the word before
+/// the first `-` and the word after the last `-`, replace everything between
+/// with `...`, and always keep the extension — `a-very-long-name.jpg` becomes
+/// `a...name.jpg`. Names that are short (see `FILE_NAME_SHORTEN_MIN_CHARS`), or
+/// that don't have at least two hyphens (so there's no middle to elide), are
+/// returned unchanged.
+fn shorten_file_name(name: &str) -> String {
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = path.extension().and_then(|e| e.to_str());
+    if stem.chars().count() < FILE_NAME_SHORTEN_MIN_CHARS {
+        return name.to_string();
+    }
+    let (Some(first), Some(last)) = (stem.find('-'), stem.rfind('-')) else {
+        return name.to_string();
+    };
+    if first == last {
+        return name.to_string();
+    }
+    // `-` is one byte, so slicing right at / after it always lands on a char boundary.
+    let shortened = format!("{}...{}", &stem[..first], &stem[last + 1..]);
+    match ext {
+        Some(ext) => format!("{shortened}.{ext}"),
+        None => shortened,
+    }
+}
+
+/// Hit area (and drawn area) of the close ('X') button: a flat rectangle
+/// flush against the top-right corner of `area`, so flinging the pointer into
+/// the corner is enough to reach it.
+fn close_button_rect(area: Rect) -> Rect {
+    Rect::xywh(
+        area.max().x - CLOSE_BUTTON_WIDTH,
+        area.min.y,
+        CLOSE_BUTTON_WIDTH,
+        CLOSE_BUTTON_HEIGHT,
+    )
+}
+
+/// Draw the close button — a red rectangle with a white 'X'. Callers only
+/// invoke this while the pointer is over `close_button_rect(area)`.
+fn draw_close_button(r: &mut Renderer, area: Rect) {
+    let rect = close_button_rect(area);
+    r.fill_rect(rect, rgba8(196, 43, 28, 230));
+    let px = 18.0;
+    let glyph_h = r.text_size("X", px).y;
+    let pos = Vec2::new(rect.center().x, rect.center().y - glyph_h / 2.0);
+    r.draw_text("X", px, pos, TextAlign::Center, WHITE);
+}
+
+/// Draw `text` in the top-left corner of `area` as floating text: no backing
+/// panel, just a thin dark outline so it stays legible over any image.
+fn draw_info_line(r: &mut Renderer, area: Rect, text: &str) {
+    let pos = area.min + Vec2::new(12.0, 10.0);
+    r.draw_text_outlined(text, INFO_TEXT_PX, pos, TextAlign::Left, rgba8(235, 235, 235, 255));
 }
 
 /// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
@@ -329,22 +439,27 @@ pub struct ImageViewerApp {
     is_randomized: bool,
     show_delete_confirmation: bool,
     last_error: Option<String>,
-    /// TEMPORARY diagnostic text, drawn in the top-left corner regardless of
-    /// what else is on screen (unlike `last_error`, which is hidden once an
-    /// image is showing). Set by `perform_delete` so its before/after state is
-    /// visible without needing `/debug` console output. Remove once the
-    /// delete-advances-to-the-wrong-image issue is tracked down.
-    debug_overlay: Option<String>,
-    /// TEMPORARY: which branch `load_image_at_index` took (cache / embedded
-    /// thumbnail / async) and, once it lands, what the async decode reply
-    /// actually contained. Drawn just below `debug_overlay`.
-    debug_load_overlay: Option<String>,
+    /// On-disk size of the currently shown file, cached at load time for the
+    /// info line (`build_info_line`) rather than re-reading it every frame.
+    /// `None` if the size couldn't be read.
+    current_file_size: Option<u64>,
+    /// True (full) resolution of the currently shown image, for the info
+    /// line. Deliberately *not* the preview/thumbnail's size: it's set only
+    /// once the real full-res decode lands (`check_pending_load`), reset to
+    /// `None` on every navigation, and never set from a preview, so the info
+    /// line shows nothing (rather than a number that would immediately jump)
+    /// until the true size is known.
+    current_full_res_size: Option<(usize, usize)>,
     clipboard: Option<Clipboard>,
     full_res_pending: bool,
     full_res_pending_since: Option<Instant>,
     full_res_worker: Option<FullResWorker>,
     preload_state: Option<Arc<PreloadState>>,
     memory_gate: Arc<MemoryGate>,
+    /// Paths handed off from newly-launched instances (see `main.rs`'s
+    /// single-instance listener and `set_instance_receiver`). Polled in
+    /// `update()`; `None` until `set_instance_receiver` is called.
+    instance_rx: Option<Receiver<PathBuf>>,
     /// Configurable key bindings for video seeking and file browsing.
     keybindings: KeyBindings,
     /// Whether to show a confirmation dialog before deleting (see `config.rs`).
@@ -352,12 +467,23 @@ pub struct ImageViewerApp {
 
     // --- input state (event-driven) ---
     mouse_pos: Vec2,
+    /// Time and position of the last left-button press, to recognize the next
+    /// one as a double-click (see `DOUBLE_CLICK_MAX_INTERVAL`/`_DISTANCE`).
+    last_left_click: Option<(Instant, Vec2)>,
     /// `Some` while the left button is held to peek at 1:1 — only entered from
     /// the default fit-to-window view. Holds the fit transform captured at the
     /// start of the gesture (see `PeekAnchor`/`update_peek_offset`). See
     /// `dragging` for the left button's behavior once the image is already
     /// manually zoomed.
     peeking: Option<PeekAnchor>,
+    /// Click position remembered when the left button is pressed to peek but
+    /// the full-res decode for this image hasn't landed yet — starting the
+    /// peek right away would anchor it against the preview's (lower)
+    /// resolution, which then noticeably resizes once full-res replaces it.
+    /// Instead, `check_pending_load` starts the peek from here once the real
+    /// thing lands (if `is_scaled_to_fit` still holds); released before that
+    /// happens, it's just dropped. See `start_peek`.
+    pending_peek: Option<Vec2>,
     /// True while the left button drags a manually-zoomed image (hand-tool
     /// style pan, content follows the cursor with a bit of fling momentum).
     /// Only entered when `is_scaled_to_fit` is already false; at the default
@@ -396,18 +522,21 @@ impl ImageViewerApp {
             is_randomized: false,
             show_delete_confirmation: false,
             last_error: None,
-            debug_overlay: None,
-            debug_load_overlay: None,
+            current_file_size: None,
+            current_full_res_size: None,
             clipboard: Clipboard::new().ok(),
             full_res_pending: false,
             full_res_pending_since: None,
             full_res_worker,
             preload_state: None,
             memory_gate,
+            instance_rx: None,
             keybindings,
             confirm_delete,
             mouse_pos: Vec2::ZERO,
+            last_left_click: None,
             peeking: None,
+            pending_peek: None,
             dragging: false,
             interacted: false,
             context_menu: None,
@@ -415,21 +544,35 @@ impl ImageViewerApp {
             scrub_frac: 0.0,
             should_quit: false,
         };
-        if let Some(path) = path {
-            app.gather_images_from_directory(&path);
-            if !app.image_files.is_empty() {
-                app.load_image_at_index(app.current_index, renderer);
-                app.start_bulk_preload();
-            } else {
-                app.last_error = Some(format!(
-                    "No supported images found in directory of '{}'",
-                    path.display()
-                ));
-            }
-        } else {
-            app.last_error = Some("No image file specified.".to_string());
+        match path {
+            Some(path) => app.open_new_file(path, renderer),
+            None => app.last_error = Some("No image file specified.".to_string()),
         }
         app
+    }
+
+    /// Hand the single-instance receiver to this app (see `main.rs`); polled
+    /// in `update()` for paths handed off by newly-launched instances.
+    pub fn set_instance_receiver(&mut self, rx: Receiver<PathBuf>) {
+        self.instance_rx = Some(rx);
+    }
+
+    /// Switch to viewing an entirely different file, possibly in a different
+    /// directory — rebuilding the browse list from `path`'s directory, same
+    /// as opening it fresh. Used both for the file given on the command line
+    /// and for one handed off by a newly-launched instance (see `main.rs`'s
+    /// single-instance listener and `update`'s use of `instance_rx`).
+    fn open_new_file(&mut self, path: PathBuf, renderer: &Renderer) {
+        self.gather_images_from_directory(&path);
+        if !self.image_files.is_empty() {
+            self.load_image_at_index(self.current_index, renderer);
+            self.start_bulk_preload();
+        } else {
+            self.last_error = Some(format!(
+                "No supported images found in directory of '{}'",
+                path.display()
+            ));
+        }
     }
 
     fn load_image_at_index(&mut self, index: usize, renderer: &Renderer) {
@@ -437,21 +580,19 @@ impl ImageViewerApp {
         let path = self.image_files[self.image_order[self.current_index]].clone();
         log::info!("Loading image: {}", path.display());
         let start_time = Instant::now();
+        self.current_file_size = fs::metadata(&path).ok().map(|m| m.len());
+        self.current_full_res_size = None;
 
         self.is_scaled_to_fit = true;
         self.velocity = Vec2::ZERO;
         self.peeking = None;
+        self.pending_peek = None;
         self.dragging = false;
         self.full_res_pending = false;
         self.full_res_pending_since = None;
 
         // Video files bypass the image decode/cache/tile pipeline entirely.
         if is_video_file(&path) {
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=VIDEO",
-                index,
-                path.file_name()
-            ));
             self.video = None;
             self.image = None;
             match VideoState::open(&path) {
@@ -476,14 +617,8 @@ impl ImageViewerApp {
                 path.display(),
                 start_time.elapsed()
             );
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=CACHE {}x{}",
-                index,
-                path.file_name(),
-                preview.width(),
-                preview.height()
-            ));
             self.display_loaded_image(preview, renderer);
+            self.sync_fit_zoom(renderer);
             self.start_full_res_load(path, renderer);
         } else if let Some(thumb) = load_embedded_thumbnail(&path) {
             log::info!(
@@ -491,23 +626,12 @@ impl ImageViewerApp {
                 path.display(),
                 start_time.elapsed()
             );
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=THUMB {}x{}",
-                index,
-                path.file_name(),
-                thumb.width(),
-                thumb.height()
-            ));
             self.display_loaded_image(to_pixel_buf(thumb), renderer);
+            self.sync_fit_zoom(renderer);
             self.start_full_res_load(path, renderer);
         } else {
             // No preview available; route the decode through the worker and show a
             // "Loading…" placeholder until the reply arrives.
-            self.debug_load_overlay = Some(format!(
-                "LOAD idx={} path={:?} via=ASYNC(pending)",
-                index,
-                path.file_name()
-            ));
             self.image = None;
             self.last_error = None;
             self.start_full_res_load(path, renderer);
@@ -540,6 +664,27 @@ impl ImageViewerApp {
             animation: None,
         });
         self.last_error = None;
+    }
+
+    /// Immediately compute and apply the fit-to-window zoom/offset for the
+    /// image that was *just* set via `display_loaded_image`/
+    /// `display_animated_image`, rather than waiting for the next `update()`
+    /// call to do it. Needed because a peek or wheel-zoom triggered in the
+    /// same event batch as a navigation (e.g. a fast tap right after
+    /// switching images, before `update()` runs) would otherwise read
+    /// `self.zoom`/`self.offset` while they still hold the *previous*
+    /// image's values.
+    fn sync_fit_zoom(&mut self, renderer: &Renderer) {
+        let Some(image) = &self.image else { return };
+        let full_res_size = Vec2::new(
+            image.full_res_image.width() as f32,
+            image.full_res_image.height() as f32,
+        );
+        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
+        let (zoom, offset) = fit_zoom_and_offset(full_res_size, area);
+        self.zoom = zoom;
+        self.offset = offset;
+        self.velocity = Vec2::ZERO;
     }
 
     fn display_animated_image(&mut self, frames: Vec<AnimationFrame>, renderer: &Renderer) {
@@ -654,14 +799,10 @@ impl ImageViewerApp {
                         }
                     };
                     let preview_width = reply.preview_width as f32;
-                    if preview_width > 0.0 && new_width > 0.0 && !self.is_scaled_to_fit {
-                        // Preserve the user's current view across the preview→full swap,
-                        // without letting the swap itself sneak the zoom under the floor.
-                        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-                        let min_zoom =
-                            fit_zoom(Vec2::new(new_width, new_height), area).min(MIN_ZOOM);
-                        self.zoom = (self.zoom * preview_width / new_width).max(min_zoom);
-                    }
+
+                    // Swap the texture in *first*, so everything below operates on
+                    // `self.image`'s new (post-swap) dimensions rather than the
+                    // about-to-be-replaced preview's.
                     match loaded {
                         LoadedImage::Static(full_res) => {
                             self.display_loaded_image(full_res, renderer)
@@ -670,15 +811,59 @@ impl ImageViewerApp {
                             self.display_animated_image(frames, renderer)
                         }
                     }
-                    let kind = if reply.is_preview { "ASYNC-preview" } else { "ASYNC-full" };
-                    self.debug_load_overlay = Some(format!(
-                        "LOAD idx={} path={:?} via={} {}x{}",
-                        self.current_index,
-                        reply.path.file_name(),
-                        kind,
-                        new_width as u32,
-                        new_height as u32,
-                    ));
+
+                    if preview_width > 0.0 && new_width > 0.0 && !self.is_scaled_to_fit {
+                        // Preserve the current apparent size across the preview→full
+                        // swap — for both the peek and plain-zoom cases alike. Pure
+                        // continuity-preserving rescale, no floor clamp: clamping here
+                        // would move the zoom without moving the offset to match,
+                        // visibly shifting/misaligning the frame right as the swap
+                        // lands. If that leaves the zoom briefly under the floor, the
+                        // next manual zoom action settles it back above via the wheel
+                        // handler's own clamp; a peek in progress settles back to
+                        // MIN_ZOOM the moment it's released and re-fit to the window.
+                        self.zoom *= preview_width / new_width;
+
+                        let was_peeking = self.peeking.is_some();
+                        if let Some(anchor) = &mut self.peeking {
+                            // The peek anchor is a *separate* reference frame (maps
+                            // cursor position to a position in the image) that also
+                            // needs rescaling the same way, so it stays valid now
+                            // that the swap has changed the texture's dimensions.
+                            // (`fit_offset` doesn't need to change: a uniform scale of
+                            // both the texture and `fit_zoom` by the same reciprocal
+                            // factor cancels out, same as for `self.zoom`/`self.offset`
+                            // just above.)
+                            anchor.fit_zoom *= preview_width / new_width;
+                        }
+                        if was_peeking {
+                            // Refresh immediately (don't wait for the next mouse
+                            // move) so the view doesn't visibly jump/misalign for
+                            // however long the hand happens to stay still. Safe to
+                            // recompute now: `self.image` above already reflects
+                            // the new (full-res) dimensions this needs, and
+                            // `update_peek_offset` reads the just-rescaled `self.zoom`.
+                            let cursor = self.mouse_pos;
+                            self.update_peek_offset(cursor, renderer);
+                        }
+                    }
+
+                    if !reply.is_preview {
+                        self.current_full_res_size = Some((new_width as usize, new_height as usize));
+                        if let Some(p) = self.pending_peek.take() {
+                            // The click that deferred is still (presumably) held —
+                            // start the peek now, anchored against the real
+                            // full-res data instead of the preview that was
+                            // showing when it was pressed. `is_scaled_to_fit` can
+                            // only have changed since if something else (a wheel
+                            // zoom, Enter) moved the view on; in that case this
+                            // click is stale, so just drop it.
+                            if self.is_scaled_to_fit {
+                                self.start_peek(p, renderer);
+                            }
+                        }
+                    }
+
                     if reply.is_preview {
                         log::info!("Showed fast preview for: {}", reply.path.display());
                     } else {
@@ -887,19 +1072,6 @@ impl ImageViewerApp {
         let Some(path) = self.image_files.get(self.image_order[self.current_index]).cloned() else {
             return;
         };
-        let before_summary = format!(
-            "idx={} del={:?} order={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-        );
-        log::info!(
-            "perform_delete: BEFORE current_index={} deleting={:?} order={:?} files={:?}",
-            self.current_index,
-            path.file_name(),
-            self.image_order,
-            self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-        );
         // Compute the cache path before moving — the hash needs the file's size/mtime.
         let cache_path = preload_cache_path(&path);
         let dest = match move_to_delete_folder(&path) {
@@ -923,28 +1095,9 @@ impl ImageViewerApp {
             }
         }
         if self.image_files.is_empty() {
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  (list now empty)"));
             self.should_quit = true;
         } else {
             self.current_index %= self.image_files.len();
-            let after_showing = self
-                .image_files
-                .get(self.image_order[self.current_index])
-                .and_then(|p| p.file_name());
-            let after_summary = format!(
-                "idx={} order={:?} showing={:?}",
-                self.current_index,
-                self.image_order,
-                after_showing,
-            );
-            self.debug_overlay = Some(format!("DELETE BEFORE {before_summary}\nDELETE AFTER  {after_summary}"));
-            log::info!(
-                "perform_delete: AFTER current_index={} order={:?} files={:?} now_showing={:?}",
-                self.current_index,
-                self.image_order,
-                self.image_files.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>(),
-                after_showing,
-            );
             self.load_image_at_index(self.current_index, renderer);
         }
     }
@@ -979,23 +1132,52 @@ impl ImageViewerApp {
     /// in the image using the fit-to-window transform captured when the peek
     /// started (`self.peeking`) — a *fixed* reference, so the cursor keeps
     /// mapping to the same position in the image for the whole gesture no
-    /// matter how far the peek's own (1:1) offset has since panned. That's
-    /// what lets one continuous hold reach every part of the image — portrait
-    /// or landscape — since a fixed relative-delta pan could run out of
-    /// screen to move the mouse across before covering a tall or wide image.
-    /// The result is clamped so the image always covers the viewport (never
-    /// shows blank space past its own edges).
+    /// matter how far the peek's own offset has since panned. That's what
+    /// lets one continuous hold reach every part of the image — portrait or
+    /// landscape — since a fixed relative-delta pan could run out of screen
+    /// to move the mouse across before covering a tall or wide image. Uses
+    /// `self.zoom` (not a hardcoded 1.0): it starts at `MIN_ZOOM` when the
+    /// peek begins, but a preview→full-res swap mid-peek rescales it to keep
+    /// the apparent size on screen continuous (see `check_pending_load`), and
+    /// this has to stay in step with whatever that rescale leaves it at. The
+    /// result is clamped so the image always covers the viewport (never shows
+    /// blank space past its own edges).
     fn update_peek_offset(&mut self, cursor: Vec2, renderer: &Renderer) {
         let Some(anchor) = self.peeking else { return };
         let Some(image) = &self.image else { return };
         let image_point = (cursor - anchor.fit_offset) / anchor.fit_zoom;
-        let raw_offset = cursor - image_point * MIN_ZOOM;
+        let raw_offset = cursor - image_point * self.zoom;
         let img_size = Vec2::new(
             image.full_res_image.width() as f32,
             image.full_res_image.height() as f32,
-        ) * MIN_ZOOM;
+        ) * self.zoom;
         let view = renderer.drawable_size();
         self.offset = clamp_offset_to_bounds(raw_offset, view, img_size);
+    }
+
+    /// Start a 1:1 peek anchored at `p`. Computes the fit-to-window reference
+    /// fresh from whatever `self.image` currently holds (rather than trusting
+    /// `self.zoom`/`self.offset`, which may not have been refreshed for it
+    /// yet), so the anchor is always correct for *this* image's dimensions —
+    /// which only matters if this is called for a fresh navigation's
+    /// synchronously-available preview; called from `check_pending_load`,
+    /// `self.image` is already the just-landed full-res data. Only call this
+    /// once the image showing is the one you want to peek — that's
+    /// `full_res_pending` finally false, or `pending_peek` if it wasn't.
+    fn start_peek(&mut self, p: Vec2, renderer: &Renderer) {
+        let Some(image) = &self.image else { return };
+        let full_res_size = Vec2::new(
+            image.full_res_image.width() as f32,
+            image.full_res_image.height() as f32,
+        );
+        let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
+        let (fit_zoom, fit_offset) = fit_zoom_and_offset(full_res_size, area);
+        self.peeking = Some(PeekAnchor { fit_zoom, fit_offset });
+        self.zoom = MIN_ZOOM;
+        self.update_peek_offset(p, renderer);
+        self.is_scaled_to_fit = false;
+        self.velocity = Vec2::ZERO;
+        self.interacted = true;
     }
 
     // --- Event handling ------------------------------------------------------
@@ -1010,7 +1192,31 @@ impl ImageViewerApp {
                 let p = Vec2::new(*x, *y);
                 self.mouse_pos = p;
                 let area = Rect::from_min_size(Vec2::ZERO, renderer.drawable_size());
-                if self.show_delete_confirmation {
+
+                let now = Instant::now();
+                let is_double_click = self
+                    .last_left_click
+                    .map(|(t, prev_p)| {
+                        now.duration_since(t) < DOUBLE_CLICK_MAX_INTERVAL
+                            && (p - prev_p).length_sq()
+                                < DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE
+                    })
+                    .unwrap_or(false);
+                self.last_left_click = Some((now, p));
+
+                if close_button_rect(area).contains(p) {
+                    // Always wins, regardless of any dialog/menu state — a
+                    // window's close button isn't supposed to need those closed
+                    // first.
+                    self.should_quit = true;
+                } else if is_double_click
+                    && !self.show_delete_confirmation
+                    && self.context_menu.is_none()
+                {
+                    // Skipped while a dialog/menu is up so a fast double-tap
+                    // aimed at dismissing one doesn't also quit the app.
+                    self.should_quit = true;
+                } else if self.show_delete_confirmation {
                     // Hit-test the dialog buttons; clicks elsewhere keep it open.
                     let (_, cancel, delete) = delete_dialog_layout(area);
                     if delete.contains(p) {
@@ -1037,16 +1243,15 @@ impl ImageViewerApp {
                     // Grabbed the seek-bar marker; scrubbing handled on motion/up.
                 } else if self.image.is_some() {
                     if self.is_scaled_to_fit {
-                        // At the default fit view: hold to peek at 1:1. Capture the
-                        // current fit transform as a fixed reference for the whole
-                        // gesture (see `update_peek_offset`), then jump to native
-                        // size anchored on the click point.
-                        self.peeking = Some(PeekAnchor { fit_zoom: self.zoom, fit_offset: self.offset });
-                        self.zoom = MIN_ZOOM;
-                        self.update_peek_offset(p, renderer);
-                        self.is_scaled_to_fit = false;
-                        self.velocity = Vec2::ZERO;
-                        self.interacted = true;
+                        if self.full_res_pending {
+                            // Only a preview is showing so far; starting the peek
+                            // against it now would anchor at a resolution about to
+                            // be replaced, visibly resizing the moment full-res
+                            // lands. Defer — check_pending_load starts it instead.
+                            self.pending_peek = Some(p);
+                        } else {
+                            self.start_peek(p, renderer);
+                        }
                     } else {
                         // Already zoomed in by hand: plain click-and-drag pans,
                         // hand-tool style, instead of peeking.
@@ -1076,6 +1281,8 @@ impl ImageViewerApp {
                 }
             }
             Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
+                // Cancel a deferred peek that never got to start.
+                self.pending_peek = None;
                 if self.scrubbing {
                     // Commit the seek to the marker's final position.
                     self.scrubbing = false;
@@ -1273,6 +1480,15 @@ impl ImageViewerApp {
     // --- Per-frame update ----------------------------------------------------
 
     pub fn update(&mut self, renderer: &mut Renderer) {
+        // A newly-launched instance handed us a file instead of opening its
+        // own window (see `main.rs`): switch to it and surface the window so
+        // the user actually sees that happen.
+        let incoming_path = self.instance_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(path) = incoming_path {
+            self.open_new_file(path, renderer);
+            renderer.raise_window();
+        }
+
         self.check_pending_load(renderer);
 
         // Engage HDR passthrough when HDR video plays on an HDR-capable display,
@@ -1322,16 +1538,9 @@ impl ImageViewerApp {
                 Vec2::new(image.full_res_image.width() as f32, image.full_res_image.height() as f32);
 
             if self.is_scaled_to_fit {
-                let aspect_ratio = full_res_size.x / full_res_size.y;
-                let available_aspect = area.width() / area.height();
-                let mut fit_size = area.size();
-                if aspect_ratio > available_aspect {
-                    fit_size.y = fit_size.x / aspect_ratio;
-                } else {
-                    fit_size.x = fit_size.y * aspect_ratio;
-                }
-                self.zoom = fit_size.x / full_res_size.x;
-                self.offset = (area.size() - fit_size) * 0.5;
+                let (zoom, offset) = fit_zoom_and_offset(full_res_size, area);
+                self.zoom = zoom;
+                self.offset = offset;
                 self.velocity = Vec2::ZERO;
             } else {
                 if self.peeking.is_none() && !self.dragging {
@@ -1386,6 +1595,40 @@ impl ImageViewerApp {
     }
 
     // --- Render --------------------------------------------------------------
+
+    /// Build the "name - WxH - size - N/total" info line for whatever's
+    /// currently shown (image or video), or `None` if there's nothing valid
+    /// to report (e.g. an error is displayed instead).
+    fn build_info_line(&self) -> Option<String> {
+        // Resolution is always the *true* full-res size, never the preview's:
+        // a preview typically lands within milliseconds, so showing its size
+        // first would just mean the number immediately jumps to the real one
+        // a moment later. Shows "..." for the brief window before it's known
+        // (see `current_full_res_size`) rather than a value that would move.
+        let res_str = if self.image.is_some() {
+            match self.current_full_res_size {
+                Some((w, h)) => format!("{w}x{h}"),
+                None => "...".to_string(),
+            }
+        } else if let Some(video) = &self.video {
+            format!("{}x{}", video.frame_size[0], video.frame_size[1])
+        } else {
+            return None;
+        };
+        let file_idx = *self.image_order.get(self.current_index)?;
+        let path = self.image_files.get(file_idx)?;
+        let file_name = path.file_name()?.to_string_lossy().into_owned();
+        let file_name = shorten_file_name(&file_name);
+        let size_str = self
+            .current_file_size
+            .map(format_file_size)
+            .unwrap_or_else(|| "N/A".to_string());
+        Some(format!(
+            "{file_name} - {res_str} - {size_str} - {}/{}",
+            self.current_index + 1,
+            self.image_files.len()
+        ))
+    }
 
     pub fn render(&mut self, renderer: &mut Renderer) -> anyhow::Result<()> {
         // Apply fullscreen toggles requested via key/menu.
@@ -1457,31 +1700,18 @@ impl ImageViewerApp {
             renderer.draw_text(&label, 18.0, area.center(), TextAlign::Center, gray(180));
         }
 
-        // TEMPORARY: diagnostic overlay for the delete-advances-to-the-wrong-
-        // image issue. Drawn unconditionally (unlike `last_error` above, which
-        // only shows when no image is loaded) so it's visible right over the
-        // newly-loaded image. Remove once that's tracked down.
-        let mut debug_line = 0i32;
-        if let Some(overlay) = &self.debug_overlay {
-            for line in overlay.split('\n') {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + debug_line as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(255, 230, 60, 255));
-                debug_line += 1;
-            }
-        }
-        if let Some(overlay) = &self.debug_load_overlay {
-            for line in overlay.split('\n') {
-                let pos = Vec2::new(area.min.x + 12.0, area.min.y + 12.0 + debug_line as f32 * 22.0);
-                renderer.draw_text_outlined(line, 16.0, pos, TextAlign::Left, rgba8(120, 220, 255, 255));
-                debug_line += 1;
-            }
-        }
-
         if self.show_delete_confirmation {
             self.render_delete_dialog(renderer, area);
         }
         if self.context_menu.is_some() {
             self.render_context_menu(renderer, area);
+        }
+
+        if let Some(line) = self.build_info_line() {
+            draw_info_line(renderer, area, &line);
+        }
+        if close_button_rect(area).contains(self.mouse_pos) {
+            draw_close_button(renderer, area);
         }
 
         renderer.end_frame()

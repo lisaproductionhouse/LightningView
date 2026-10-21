@@ -1387,12 +1387,24 @@ impl ImageViewerApp {
         let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
         let gui = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
         if ctrl && alt && gui {
-            let display_index = match kc {
-                Keycode::Num1 | Keycode::Kp1 => Some(0),
-                Keycode::Num2 | Keycode::Kp2 => Some(1),
-                Keycode::Num3 | Keycode::Kp3 => Some(2),
+            // SDL defines the keycode of a printable character as that
+            // character's own value (true since SDL1, unrelated to how any
+            // given Rust binding happens to name the enum variant — which
+            // this crate apparently doesn't spell "Num1"/"Num2"/"Num3"), so
+            // compare against the digit characters directly rather than
+            // guessing at a named top-row-digit variant again.
+            let top_row_digit = match kc as i32 {
+                v if v == '1' as i32 => Some(0),
+                v if v == '2' as i32 => Some(1),
+                v if v == '3' as i32 => Some(2),
                 _ => None,
             };
+            let display_index = top_row_digit.or(match kc {
+                Keycode::Kp1 => Some(0),
+                Keycode::Kp2 => Some(1),
+                Keycode::Kp3 => Some(2),
+                _ => None,
+            });
             if let Some(display_index) = display_index {
                 self.send_to_display(display_index, renderer);
                 return;

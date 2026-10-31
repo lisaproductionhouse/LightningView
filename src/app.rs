@@ -157,6 +157,23 @@ fn shorten_file_name(name: &str) -> String {
     }
 }
 
+/// Find `target`'s position in `files`, matching case-insensitively if an
+/// exact match misses. `Path`'s equality is always case-sensitive, even on
+/// Windows, where the filesystem itself is not — so a path's case as handed
+/// to us (e.g. a command-line argument from a file-association double-click,
+/// which doesn't always carry the exact on-disk casing) can differ from what
+/// `fs::read_dir` reports for that very file, and an exact-only match then
+/// silently fails to find it — which is what used to make opening a file
+/// from Explorer sometimes land on the wrong image in its folder.
+fn position_path(files: &[PathBuf], target: &Path) -> Option<usize> {
+    files.iter().position(|p| p == target).or_else(|| {
+        let target_lower = target.to_string_lossy().to_lowercase();
+        files
+            .iter()
+            .position(|p| p.to_string_lossy().to_lowercase() == target_lower)
+    })
+}
+
 /// Hit area (and drawn area) of the close ('X') button: a flat rectangle
 /// flush against the top-right corner of `area`, so flinging the pointer into
 /// the corner is enough to reach it.
@@ -957,8 +974,15 @@ impl ImageViewerApp {
             }
         };
         let files = scan_supported_images(parent_dir);
-        if let Some(index) = files.iter().position(|p| p == file_path) {
-            self.current_index = index;
+        match position_path(&files, file_path) {
+            Some(index) => self.current_index = index,
+            None => {
+                log::warn!(
+                    "Could not find '{}' in its own directory listing (even case-insensitively); defaulting to the first image.",
+                    file_path.display()
+                );
+                self.current_index = 0;
+            }
         }
         self.image_files = files;
         self.image_order = (0..self.image_files.len()).collect();
@@ -1003,7 +1027,7 @@ impl ImageViewerApp {
             let mut new_order = Vec::with_capacity(new_files.len());
             let mut seen = vec![false; new_files.len()];
             for path in &old_path_order {
-                if let Some(idx) = new_files.iter().position(|p| p == path) {
+                if let Some(idx) = position_path(&new_files, path) {
                     if !seen[idx] {
                         seen[idx] = true;
                         new_order.push(idx);
@@ -1023,7 +1047,7 @@ impl ImageViewerApp {
         self.image_files = new_files;
 
         if let Some(cp) = current_path {
-            if let Some(file_idx) = self.image_files.iter().position(|p| p == &cp) {
+            if let Some(file_idx) = position_path(&self.image_files, &cp) {
                 if let Some(order_idx) = self.image_order.iter().position(|&i| i == file_idx) {
                     self.current_index = order_idx;
                 }

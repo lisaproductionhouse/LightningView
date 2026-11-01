@@ -1401,16 +1401,17 @@ impl ImageViewerApp {
             return;
         }
 
-        // Send to monitor N (Ctrl+Win+Alt+1/2/3). Works regardless of any
-        // dialog/menu state, same reasoning as the close button. NOTE: on
-        // Windows, Win+<number> is frequently claimed system-wide for
-        // taskbar app-switching before any application (including this one)
-        // ever sees the key event — if this shortcut doesn't fire, that's
-        // almost certainly why, and there isn't anything app-side to do
-        // about it beyond picking different modifier keys.
+        // Send to monitor N (Win+Alt+1/2/3). Works regardless of any
+        // dialog/menu state, same reasoning as the close button. Like the
+        // Ctrl+C check above, extra modifiers held on top aren't excluded.
+        // NOTE: on Windows, Win+Alt+<number> is claimed system-wide (it opens
+        // the jump list of the Nth taskbar app) before any application,
+        // including this one, ever sees the key event — if this shortcut
+        // doesn't fire, that's almost certainly why, and there isn't anything
+        // app-side to do about it beyond picking different modifier keys.
         let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
         let gui = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
-        if ctrl && alt && gui {
+        if alt && gui {
             // SDL defines the keycode of a printable character as that
             // character's own value (true since SDL1, unrelated to how any
             // given Rust binding happens to name the enum variant — which
@@ -1525,7 +1526,7 @@ impl ImageViewerApp {
     }
 
     /// Move the window onto display `display_index` (0-based) — the
-    /// Ctrl+Win+Alt+<N> shortcut. A fullscreen window generally won't
+    /// Win+Alt+<N> shortcut. A fullscreen window generally won't
     /// reposition across displays on its own (the OS/compositor tends to
     /// hold it to whichever display it's already fullscreened on), so if
     /// we're fullscreen this drops to windowed just long enough to move,

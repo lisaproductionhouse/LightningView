@@ -1401,27 +1401,29 @@ impl ImageViewerApp {
             return;
         }
 
-        // Send to monitor N (Win+Alt+1/2/3). Works regardless of any
+        // Send to monitor N (Win+Alt+Shift+1/2/3). Works regardless of any
         // dialog/menu state, same reasoning as the close button. Like the
         // Ctrl+C check above, extra modifiers held on top aren't excluded.
-        // NOTE: on Windows, Win+Alt+<number> is claimed system-wide (it opens
-        // the jump list of the Nth taskbar app) before any application,
-        // including this one, ever sees the key event — if this shortcut
-        // doesn't fire, that's almost certainly why, and there isn't anything
-        // app-side to do about it beyond picking different modifier keys.
+        // Shift is part of the combo because Windows claims Win+<number> and
+        // Win+Alt+<number> system-wide (taskbar app launch / jump list), so
+        // those never reach the app.
         let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
         let gui = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
-        if alt && gui {
+        let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+        if alt && gui && shift {
             // SDL defines the keycode of a printable character as that
             // character's own value (true since SDL1, unrelated to how any
             // given Rust binding happens to name the enum variant — which
             // this crate apparently doesn't spell "Num1"/"Num2"/"Num3"), so
             // compare against the digit characters directly rather than
-            // guessing at a named top-row-digit variant again.
+            // guessing at a named top-row-digit variant again. SDL normally
+            // reports the *unshifted* keycode in a key event even with Shift
+            // held, but the US-layout shifted symbols ('!', '@', '#') are
+            // accepted too in case a platform reports Shift as applied.
             let top_row_digit = match kc as i32 {
-                v if v == '1' as i32 => Some(0),
-                v if v == '2' as i32 => Some(1),
-                v if v == '3' as i32 => Some(2),
+                v if v == '1' as i32 || v == '!' as i32 => Some(0),
+                v if v == '2' as i32 || v == '@' as i32 => Some(1),
+                v if v == '3' as i32 || v == '#' as i32 => Some(2),
                 _ => None,
             };
             let display_index = top_row_digit.or(match kc {
@@ -1526,7 +1528,7 @@ impl ImageViewerApp {
     }
 
     /// Move the window onto display `display_index` (0-based) — the
-    /// Win+Alt+<N> shortcut. A fullscreen window generally won't
+    /// Win+Alt+Shift+<N> shortcut. A fullscreen window generally won't
     /// reposition across displays on its own (the OS/compositor tends to
     /// hold it to whichever display it's already fullscreened on), so if
     /// we're fullscreen this drops to windowed just long enough to move,
